@@ -3,3 +3,6 @@
 .LSOverride
 __MACOSX
 Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
