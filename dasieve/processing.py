@@ -1,0 +1,258 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from dascore.utils.patch import get_dim_sampling_rate
+from dascore.units import m
+import dascore as dc
+
+
+def normalize_patch(patch: dc.Patch, target_dx_m: float = 5.0) -> dc.Patch:
+    fs = float(get_dim_sampling_rate(patch, "time"))
+    gl = patch.attrs.gauge_length * m
+    scale_factor = 1 / 8192
+    norm = scale_factor * (116 * fs) / gl
+    return (patch * norm * 1e-9).set_units("m/m/s")
+
+
+def cmd_remove(
+    patch: dc.Patch,
+    dim: str = "distance",
+    window: float | None = None,
+    samples: bool = False,
+    method: str = "median",
+) -> dc.Patch:
+    """Remove common-mode noise by block-wise median subtraction along ``dim``.
+
+    The dimension is split into non-overlapping blocks of size ``window``.
+    Within each block, the median across all channels/samples is computed
+    (one scalar per position in the perpendicular dimension) and subtracted
+    from every trace in that block. If ``window`` is None, the whole dimension
+    is treated as a single block.
+
+    Args:
+        patch: DAS patch with dims ("time", "distance").
+        dim: Dimension to split into blocks, either "distance" or "time".
+        window: Block size in physical units (metres for distance, seconds for
+            time), or in samples if ``samples=True``. None uses the full dim.
+        samples: If True, treat ``window`` as a sample/channel count.
+
+    Returns:
+        Patch with block-wise common mode removed (same shape and coords as input).
+    """
+    if method == "median":
+        coords = patch.coords.get_array(dim)
+        n = len(coords)
+        dim_axis = patch.dims.index(dim)
+
+        if window is None:
+            block_size = n
+        elif samples:
+            block_size = max(1, int(window))
+        else:
+            fs = float(get_dim_sampling_rate(patch, dim))
+            block_size = max(1, round(window * fs))
+
+        data = patch.data.copy()
+        for start in range(0, n, block_size):
+            end = min(start + block_size, n)
+            idx = [slice(None), slice(None)]
+            idx[dim_axis] = slice(start, end)
+            block = data[tuple(idx)]
+            common_mode = np.median(block, axis=dim_axis, keepdims=True)
+            data[tuple(idx)] -= common_mode
+    elif method == "stack":
+        coords = patch.coords.get_array(dim)
+        n = len(coords)
+        dim_axis = patch.dims.index(dim)
+        other_dim = next(d for d in patch.dims if d != dim)
+
+        if window is None:
+            block_size = n
+        elif samples:
+            block_size = max(1, int(window))
+        else:
+            fs = float(get_dim_sampling_rate(patch, dim))
+            block_size = max(1, round(window * fs))
+
+        data = patch.data.copy()
+        for start in range(0, n, block_size):
+            end = min(start + block_size, n)
+            idx = [slice(None), slice(None)]
+            idx[dim_axis] = slice(start, end)
+            sub_data = data[tuple(idx)]
+            sub_patch = patch.new(
+                data=sub_data,
+                coords={
+                    dim: patch.coords.get_array(dim)[start:end],
+                    other_dim: patch.coords.get_array(other_dim),
+                },
+            )
+            mean_patch = sub_patch.phase_weighted_stack(
+                stack_dim=dim, power=0, dim_reduce="squeeze"
+            )
+            common_mode = np.expand_dims(mean_patch.data, axis=dim_axis)
+            data[tuple(idx)] -= common_mode
+
+    return patch.new(data=data)
+
+
+def decimate(
+    patch: dc.Patch,
+    target_fs: float | None = None,
+    target_dx: float | None = None,
+    plot: bool = False,
+    lateral_stacking: bool = True,
+    pws_power: float = 2.0,
+    plot_channel: int | None = None,
+) -> dc.Patch:
+    """Decimate a DAS patch in time, space, or both.
+
+    Args:
+        patch: DAS patch with shape (nt, nch).
+        target_fs: Target sampling rate in Hz. If provided, decimates in time.
+        target_dx: Target channel spacing in metres. If provided, decimates in space.
+        plot: If True, visualise decimation.
+        lateral_stacking: If True (default), average groups of channels before
+            spatial decimation instead of applying the FIR anti-alias filter.
+        pws_power: Phase-weighted stack exponent used when lateral_stacking=True.
+        plot_channel: Channel index to highlight in plots. Defaults to the middle
+            channel when None.
+    """
+    if target_fs is None and target_dx is None:
+        raise ValueError("At least one of target_fs or target_dx must be provided")
+
+    result = patch
+    stages = [(patch, f"Original ({patch.data.shape[1]} ch)")] if plot else None
+
+    if target_fs is not None:
+        current_fs = float(get_dim_sampling_rate(result, "time"))
+        factor = round(current_fs / target_fs)
+        if factor < 1:
+            raise ValueError(
+                f"target_fs ({target_fs} Hz) exceeds current rate ({current_fs} Hz)"
+            )
+        result = result.decimate(time=factor, filter_type="fir")
+        if plot:
+            stages.append((result, f"Temporal Decimation ×{factor}"))
+
+    if target_dx is not None:
+        dist = result.coords.get_array("distance")
+        current_dx = float(np.median(np.diff(dist)))
+        factor = round(target_dx / current_dx)
+        if factor < 1:
+            raise ValueError(
+                f"target_dx ({target_dx} m) is smaller than current spacing ({current_dx} m)"
+            )
+        if lateral_stacking:
+            result = _lateral_stack(result, factor, pws_power=pws_power)
+        else:
+            result = result.decimate(distance=factor, filter_type="fir")
+        if plot:
+            method = f"PWS, Power= {pws_power}" if lateral_stacking else "FIR"
+            stages.append(
+                (
+                    result,
+                    f"Spatial Decimation ×{factor} {method}",
+                )
+            )
+
+    if plot:
+        _plot_decimation(stages, plot_channel)
+
+    return result
+
+
+def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.Patch:
+    """Phase-weighted stack groups of *factor* channels, returning a spatially decimated patch."""
+    dist = patch.coords.get_array("distance")
+    nch = len(dist)
+    n_trim = (nch // factor) * factor
+    n_groups = n_trim // factor
+
+    new_dist = dist[:n_trim].reshape(n_groups, factor).mean(axis=1)
+    cols = []
+
+    for i in range(n_groups):
+        sub_data = patch.data[:, i * factor : (i + 1) * factor]
+        sub_dist = dist[i * factor : (i + 1) * factor]
+        sub = patch.new(
+            data=sub_data,
+            coords={"distance": sub_dist, "time": patch.coords.get_array("time")},
+        )
+        result = sub.phase_weighted_stack(
+            stack_dim="distance", power=pws_power, dim_reduce="squeeze"
+        )
+        cols.append(result.data)
+
+    stacked = np.column_stack(cols)  # (nt, n_groups)
+    return patch.new(
+        data=stacked,
+        coords={"distance": new_dist, "time": patch.coords.get_array("time")},
+    )
+
+
+def _plot_decimation(
+    stages: list[tuple[dc.Patch, str]],
+    channel: int | None = None,
+) -> None:
+    """Waterfall + extracted trace for each decimation stage (n×2 grid)."""
+    n = len(stages)
+    colors = ["black", "red", "tab:blue"]
+
+    data0 = stages[0][0].data
+    nch = data0.shape[1]
+    ch = nch // 2 if channel is None else channel
+    orig_dist = stages[0][0].coords.get_array("distance")
+    t0 = stages[0][0].coords.get_array("time")[0]
+    vmax = np.percentile(np.abs(data0), 99)
+
+    fig, axes = plt.subplots(
+        n,
+        2,
+        figsize=(7.5, 2.7 * n),
+        gridspec_kw={"width_ratios": [3, 1]},
+        constrained_layout=True,
+    )
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    im = None
+    for row, (patch, label) in enumerate(stages):
+        d = patch.data
+        time = patch.coords.get_array("time")
+        t_s = (time - t0) / np.timedelta64(1, "s")
+        dist = patch.coords.get_array("distance")
+        ch_row = int(np.argmin(np.abs(dist - float(orig_dist[ch]))))
+
+        ax_im = axes[row, 0]
+        ax_tr = axes[row, 1]
+
+        im = ax_im.imshow(
+            d.T,
+            aspect="auto",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+            extent=[t_s[0], t_s[-1], float(dist[-1]), float(dist[0])],
+            interpolation="nearest",
+        )
+        ax_im.axhline(float(dist[ch_row]), color="red", lw=0.8, ls="--")
+        ax_im.set_title(label, fontsize=8)
+        ax_im.set_ylabel("Distance (m)", fontsize=7)
+        ax_im.tick_params(labelsize=6)
+        if row == n - 1:
+            ax_im.set_xlabel("Time (s)", fontsize=7)
+
+        ax_tr.plot(t_s, d[:, ch_row], lw=0.3, color=colors[row])
+        ax_tr.set_title(f"Ch {ch_row} ({dist[ch_row]:.0f} m)", fontsize=8)
+        ax_tr.set_ylabel("Amplitude", fontsize=7)
+        ax_tr.tick_params(labelsize=6)
+        ax_tr.yaxis.get_offset_text().set_fontsize(6)
+        if row == n - 1:
+            ax_tr.set_xlabel("Time (s)", fontsize=7)
+
+    cax = axes[-1, 0].inset_axes([0.02, 0.88, 0.35, 0.05])
+    cbar = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cbar.set_label("Amplitude", fontsize=7)
+    cbar.ax.tick_params(labelsize=6)
+    cbar.ax.xaxis.get_offset_text().set_fontsize(6)
+    plt.show()
