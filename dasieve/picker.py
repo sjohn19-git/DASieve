@@ -353,7 +353,9 @@ def pick_phasenet(
     ``score`` (phase probability); cft_* and off_* columns are NaN.
     """
     import torch
+    import matplotlib
 
+    _mpl_backend = matplotlib.get_backend()
     predict = _import_eqnet_predict(eqnet_dir)
 
     if device is None:
@@ -400,6 +402,7 @@ def pick_phasenet(
         predict.main(args)
     finally:
         os.chdir(cwd)
+        matplotlib.use(_mpl_backend)
 
     # EQNet writes picks under result_dir/picks_phasenet_das[/_patch]/...csv.
     csv_files = _glob.glob(os.path.join(result_dir, "**", "*.csv"), recursive=True)
