@@ -1,0 +1,4 @@
+[submodule "dasieve/EQNet"]
+	path = dasieve/EQNet
+	url = https://github.com/AI4EPS/EQNet
+	ignore = dirty
