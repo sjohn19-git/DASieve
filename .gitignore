@@ -6,3 +6,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+# SQLite pick catalog (generated data)
+picks.sqlite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

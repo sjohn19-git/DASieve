@@ -21,6 +21,7 @@ importlib.reload(dasieve.picker)
 from dasieve.qc import compute_psd, append_to_store, plot_pdf, plot_patch
 from dasieve.processing import normalize_patch, decimate, cmd_remove
 from dasieve.picker import trigger_picker, pick_phasenet
+from dasieve.catalog import save_picks
 
 sys.path.insert(0, os.path.expanduser("~/DASieve"))
 
@@ -52,11 +53,14 @@ patch = cmd_remove(patch, dim="distance", window=5000, method="median")
 plot_patch(patch)
 
 
-trigger_picker(
+source_file = h5_files[0]
+
+df_trig = trigger_picker(
     patch, sta=0.3, lta=2.0, thr_on=4.0, thr_off=1, plot=True, plot_channel=None
 )
+save_picks(df_trig, file_name=source_file, author="trigger")
 
-df = trigger_picker(
+df_ar = trigger_picker(
     patch,
     method="ar",
     f1=1.0,
@@ -72,8 +76,10 @@ df = trigger_picker(
     plot=True,
     plot_channel=None,
 )
+save_picks(df_ar, file_name=source_file, author="ar")
 
 df_pn = pick_phasenet(patch, min_prob=0.3, plot=True, plot_channel=None)
+save_picks(df_pn, file_name=source_file, author="phasenet")
 
 # if __name__ == "__main__":
 #     input_dir = "/Volumes/Elements"
