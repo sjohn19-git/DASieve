@@ -37,8 +37,21 @@ h5_files = [
 patch = dc.spool(h5_files[0])[0]
 patch = patch.select(distance=(0, 3000))
 patch = normalize_patch(patch)
+plot_patch(patch)
+freqs, psd_db = compute_psd(patch)
+save_dir = os.path.expanduser("~/Downloads")
+
+store_path = os.path.join(save_dir, "psd_qc.pkl")
+timestamp = patch.coords.min("time")
+append_to_store(store_path, timestamp, freqs, psd_db)
+
+
+plot_path = os.path.join(save_dir, "psd_pdf.png")
+plot_pdf(store_path=store_path, out_path=plot_path, vmax=0.8, ylim=(-160, -132.5))
+
+
 patch = decimate(
-    patch, target_fs=500, target_dx=5, plot=True, lateral_stacking=False, pws_power=2
+    patch, target_fs=500, target_dx=5, plot=True, lateral_stacking=True, pws_power=2
 )
 
 # inject 3e-6 spike at mid time sample across all channels for testing
@@ -49,7 +62,7 @@ _data[_mid : _mid + 10, :] += 3e-6
 patch = patch.new(data=_data)
 plot_patch(patch)
 
-patch = cmd_remove(patch, dim="distance", window=5000, method="median")
+patch = cmd_remove(patch, dim="distance", window=5000, method="stack")
 plot_patch(patch)
 
 

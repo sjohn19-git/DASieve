@@ -4,15 +4,16 @@ qc.py
 PSD QC product for DASieve.
 
 Computes per-channel Welch PSD from a DASCore patch and appends it to a
-persistent HDF5 store. One row per 30s file, shape (time, channel, freq).
+persistent pandas pickle store. One row per (time, channel) pair.
 
 Pipeline position: runs on the raw patch (before resample/decimate),
 corresponding to the "PSD QC Product — always runs" branch in the architecture.
 
-Store layout (psd_qc.h5):
-    /psd          (n_time, n_channel, n_freq)  float32   gzip compressed
-    /timestamps   (n_time,)                    int64     nanoseconds since epoch
-    /frequencies  (n_freq,)                    float64   Hz
+Store layout (psd_qc.pkl) — pandas DataFrame:
+    time   : pd.Timestamp   UTC start time of the processed file
+    ch     : int            channel index
+    freqs  : np.ndarray     frequency vector in Hz, shape (n_freq,)
+    psds   : np.ndarray     PSD in dB, shape (n_freq,)
 
 Authors: Sebin John, 2025
 """
@@ -21,7 +22,7 @@ import logging
 from pathlib import Path
 from dascore.utils.patch import get_dim_sampling_rate
 import numpy as np
-import h5py
+import pandas as pd
 import scipy.signal
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -42,20 +43,19 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
 
     Processing chain per channel:
         1. Linear detrend
-        2. 5% Tukey taper
-        3. Welch (Hann window, 50% overlap, nperseg ~ fs/0.5 rounded to power of 2)
-        4. Convert to dB: 10 * log10(Pxx)
+        2. Welch (Hann window, 50% overlap, nperseg ~ fs/0.5 rounded to power of 2)
+        3. Convert to dB: 10 * log10(Pxx)
 
     Parameters
     ----------
     patch : dc.Patch
-        Raw DASCore patch (distance × time layout).
+        Raw DASCore patch (time × channel layout).
 
     Returns
     -------
     frequencies : np.ndarray, shape (n_freq,)
         Frequency vector in Hz.
-    psd_db : np.ndarray, shape (n_channel, n_freq), float32
+    psd_db : np.ndarray, shape (n_freq, n_channel), float32
         PSD in dB for each channel.
     """
     fs = get_dim_sampling_rate(patch, "time")
@@ -98,77 +98,51 @@ def append_to_store(
     psd_db: np.ndarray,
 ) -> None:
     """
-    Append one PSD time step to the HDF5 store.
+    Append one PSD time step to the pandas pickle store.
 
-    Creates the store and datasets on first call. Subsequent calls extend
-    the time axis. Thread-unsafe — designed for single-writer pipeline use.
+    Creates the store on first call. Subsequent calls extend the DataFrame.
+    Thread-unsafe — designed for single-writer pipeline use.
 
     Parameters
     ----------
     store_path : str
-        Path to the HDF5 file (created if it does not exist).
+        Path to the pickle file (created if it does not exist).
     timestamp : np.datetime64
         UTC start time of the processed file.
     frequencies : np.ndarray, shape (n_freq,)
-        Frequency vector in Hz (written once, verified on subsequent calls).
-    psd_db : np.ndarray, shape (n_channel, n_freq), float32
+        Frequency vector in Hz.
+    psd_db : np.ndarray, shape (n_freq, n_channel), float32
         PSD in dB to append.
     """
     store_path = str(store_path)
     Path(store_path).parent.mkdir(parents=True, exist_ok=True)
 
     n_freq, n_ch = psd_db.shape
-    ts_ns = np.datetime64(timestamp, "ns").view(np.int64)
+    t = pd.Timestamp(timestamp)
 
-    with h5py.File(store_path, "a") as f:
-        # --- First write: create datasets ---
-        if "psd" not in f:
-            f.create_dataset(
-                "psd",
-                data=psd_db[np.newaxis, :, :],  # (1, n_freq, n_ch)
-                maxshape=(None, n_freq, n_ch),
-                chunks=(120, n_freq, n_ch),
-                dtype=np.float32,
-            )
-            f.create_dataset(
-                "timestamps",
-                data=np.array([ts_ns], dtype=np.int64),
-                maxshape=(None,),
-                chunks=(120,),
-            )
-            f.create_dataset(
-                "frequencies",
-                data=frequencies.astype(np.float64),
-            )
-            log.info(
-                f"Created PSD store: {store_path}  (n_channels={n_ch}, n_freq={n_freq})"
-            )
+    rows = pd.DataFrame(
+        {
+            "time": t,
+            "ch": np.arange(n_ch),
+            "freqs": [frequencies] * n_ch,
+            "psds": [psd_db[:, i] for i in range(n_ch)],
+        }
+    )
 
-        # --- Subsequent writes: extend along time axis ---
-        else:
-            # Sanity check frequencies match
-            stored_freq = f["frequencies"][:]
-            if not np.allclose(stored_freq, frequencies, rtol=1e-4):
-                raise ValueError(
-                    "Frequency vector mismatch — store was created with different fs or nperseg"
-                )
+    if Path(store_path).exists():
+        existing = pd.read_pickle(store_path)
+        dup = existing["time"] == t
+        if dup.any():
+            log.warning(f"Timestamp {timestamp} already in store — overwriting")
+            existing = existing[~dup]
+        df = pd.concat([existing, rows], ignore_index=True)
+    else:
+        df = rows
+        log.info(
+            f"Created PSD store: {store_path}  (n_channels={n_ch}, n_freq={n_freq})"
+        )
 
-            existing = np.where(f["timestamps"][:] == ts_ns)[0]
-            if existing.size:
-                idx = existing[0]
-                log.warning(
-                    f"Timestamp {timestamp} already in store — overwriting row {idx}"
-                )
-                f["psd"][idx, :, :] = psd_db
-                return
-
-            t = f["psd"].shape[0]
-            f["psd"].resize(t + 1, axis=0)
-            f["psd"][t, :, :] = psd_db
-
-            f["timestamps"].resize(t + 1, axis=0)
-            f["timestamps"][t] = ts_ns
-
+    df.to_pickle(store_path)
     log.debug(f"Appended t={timestamp} to {store_path}")
     _trim_store(store_path, max_bytes=85 * 1024**3)
 
@@ -180,21 +154,16 @@ def append_to_store(
 
 def _trim_store(store_path: str, max_bytes: int = 85 * 1024**3) -> None:
     """
-    If the HDF5 store exceeds max_bytes, drop the oldest rows until it fits.
-
-    HDF5 cannot reclaim space in-place, so this rewrites the file to a
-    temporary path then replaces the original. Drops rows in chunks of 120
-    (1 hour) to avoid trimming one row at a time.
+    If the pickle store exceeds max_bytes, drop the oldest timestamps until it fits.
 
     Parameters
     ----------
     store_path : str
-        Path to the HDF5 store.
+        Path to the pickle store.
     max_bytes : int
-        Maximum allowed file size in bytes. Default 250 GB.
+        Maximum allowed file size in bytes. Default 85 GB.
     """
     import os
-    import tempfile
 
     size = os.path.getsize(store_path)
     if size <= max_bytes:
@@ -202,51 +171,25 @@ def _trim_store(store_path: str, max_bytes: int = 85 * 1024**3) -> None:
 
     log.warning(
         f"Store size {size / 1024**3:.1f} GB exceeds limit "
-        f"{max_bytes / 1024**3:.0f} GB — trimming oldest rows"
+        f"{max_bytes / 1024**3:.0f} GB — trimming oldest timestamps"
     )
 
-    with h5py.File(store_path, "r") as f:
-        n_time = f["psd"].shape[0]
-        n_ch = f["psd"].shape[1]
-        n_freq = f["psd"].shape[2]
-        freqs = f["frequencies"][:]
+    df = pd.read_pickle(store_path)
+    unique_times = sorted(df["time"].unique())
+    n_times = len(unique_times)
 
-        # Estimate bytes per row and how many rows to drop to reach 80% of limit
-        bytes_per_row = (n_ch * n_freq * 4) + 8  # float32 psd + int64 timestamp
-        rows_to_drop = int(np.ceil((size - max_bytes * 0.8) / bytes_per_row))
-        # Drop in multiples of 120 (chunk size) to keep chunk alignment
-        rows_to_drop = int(np.ceil(rows_to_drop / 120) * 120)
-        rows_to_drop = min(rows_to_drop, n_time - 1)  # always keep at least 1 row
+    fraction_to_keep = (max_bytes * 0.8) / size
+    keep_n = max(1, int(n_times * fraction_to_keep))
+    keep_times = set(unique_times[-keep_n:])
 
-        keep_from = rows_to_drop
-        psd_keep = f["psd"][keep_from:, :, :]
-        ts_keep = f["timestamps"][keep_from:]
+    dropped = n_times - keep_n
+    df = df[df["time"].isin(keep_times)].reset_index(drop=True)
+    df.to_pickle(store_path)
 
-    log.info(f"Dropping {rows_to_drop} oldest rows, keeping {n_time - rows_to_drop}")
-
-    # Write surviving data to a temp file then atomically replace
-    tmp_path = store_path + ".tmp"
-    with h5py.File(tmp_path, "w") as f:
-        f.create_dataset(
-            "psd",
-            data=psd_keep,
-            maxshape=(None, n_ch, n_freq),
-            chunks=(120, n_ch, n_freq),
-            dtype=np.float32,
-        )
-        f.create_dataset(
-            "timestamps",
-            data=ts_keep,
-            maxshape=(None,),
-            chunks=(120,),
-        )
-        f.create_dataset("frequencies", data=freqs)
-
-    import os
-
-    os.replace(tmp_path, store_path)
     new_size = os.path.getsize(store_path)
-    log.info(f"Store trimmed: {new_size / 1024**3:.1f} GB")
+    log.info(
+        f"Dropped {dropped} timestamps — store trimmed to {new_size / 1024**3:.1f} GB"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,62 +333,105 @@ def plot_patch(
 def plot_pdf(
     store_path: str,
     out_path: str,
-    channel: int | None = None,
     t_start=None,
     t_end=None,
-    p_min: float = -20,
-    p_max: float = 40,
+    p_min: float | None = None,
+    p_max: float | None = None,
     fmin: float = 1.0,
     fmax: float = 250.0,
     bins: tuple = (300, 200),
     vmin: float | None = None,
     vmax: float | None = None,
+    ylim: tuple | None = None,
+    channel: int | None = None,
 ) -> None:
-    """Plot a 2-D PSD probability density function from the QC store."""
-    with h5py.File(store_path, "r") as f:
-        freqs = f["frequencies"][:]
-        ts_ns = f["timestamps"][:]
-        n_channels = f["psd"].shape[2]
+    """
+    Two-row plot: 2-D PSD-PDF across all channels (top) and median PSD line
+    for one channel (bottom).
 
-        ch = n_channels // 2 if channel is None else channel
+    Parameters
+    ----------
+    ylim : tuple (ymin, ymax), optional
+        Explicit y-axis limits in dB applied to both panels.
+    channel : int, optional
+        Channel index for the line plot. Defaults to the mid channel.
+    """
+    df = pd.read_pickle(store_path)
 
-        mask = np.ones(len(ts_ns), dtype=bool)
-        if t_start is not None:
-            mask &= ts_ns >= np.datetime64(t_start, "ns").view(np.int64)
-        if t_end is not None:
-            mask &= ts_ns <= np.datetime64(t_end, "ns").view(np.int64)
+    if t_start is not None:
+        df = df[df["time"] >= pd.Timestamp(t_start)]
+    if t_end is not None:
+        df = df[df["time"] <= pd.Timestamp(t_end)]
 
-        freq_mask = (freqs >= fmin) & (freqs <= fmax)
-        freqs = freqs[freq_mask]
-        psd_ch = f["psd"][:, :, ch][mask][:, freq_mask]
+    freqs = df["freqs"].iloc[0]
+    freq_mask = (freqs >= fmin) & (freqs <= fmax)
+    freqs_masked = freqs[freq_mask]
 
-    all_f = np.tile(freqs, psd_ch.shape[0])
-    all_p = psd_ch.ravel()
+    psd_matrix = np.vstack(df["psds"].to_numpy())  # (n_rows, n_freq)
+    psd_masked = psd_matrix[:, freq_mask]  # (n_rows, n_masked_freq)
+
+    all_f = np.tile(freqs_masked, psd_masked.shape[0])
+    all_p = psd_masked.ravel()
+
+    if p_min is None:
+        p_min = float(np.percentile(all_p, 1))
+    if p_max is None:
+        p_max = float(np.percentile(all_p, 99))
+    log.info("PSD range: p_min=%.1f dB, p_max=%.1f dB", p_min, p_max)
+
     H, f_edges, p_edges = np.histogram2d(
         all_f, all_p, bins=bins, range=[[fmin, fmax], [p_min, p_max]]
     )
     H /= H.max()
 
-    fig, ax = plt.subplots(figsize=(7.5, 4), dpi=300)
-    pcm = ax.pcolormesh(
+    n_channels = df["ch"].nunique()
+    ch = n_channels // 2 if channel is None else channel
+
+    ch_rows = df[df["ch"] == ch]
+    psd_ch = np.vstack(ch_rows["psds"].to_numpy())[:, freq_mask]
+    median_psd = np.median(psd_ch, axis=0)
+
+    fig, (ax_pdf, ax_line) = plt.subplots(
+        2, 1, figsize=(7.5, 7), dpi=300, gridspec_kw={"hspace": 0.4}
+    )
+
+    # --- top: 2-D PDF ---
+    pcm = ax_pdf.pcolormesh(
         f_edges,
         p_edges,
         H.T,
         cmap="jet",
         shading="auto",
         vmin=0 if vmin is None else vmin,
-        vmax=H.max() if vmax is None else vmax,
+        vmax=1.0 if vmax is None else vmax,
         rasterized=True,
     )
-    ax.set_xscale("log")
-    ax.set_xlim(fmin, fmax)
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Power (dB)")
-    ax.set_title(f"PSD–PDF  |  channel {ch}")
-    ax.xaxis.set_major_locator(plt.LogLocator(base=10, numticks=10))
-    ax.tick_params(axis="x", which="minor", length=3)
-    ax.tick_params(axis="x", which="major", length=6)
-    fig.colorbar(pcm, ax=ax, pad=0.02, fraction=0.035).set_label("Probability")
+    ax_pdf.set_xscale("log")
+    ax_pdf.set_xlim(fmin, fmax)
+    if ylim is not None:
+        ax_pdf.set_ylim(ylim)
+    ax_pdf.set_xlabel("Frequency (Hz)")
+    ax_pdf.set_ylabel("Power (dB)")
+    ax_pdf.set_title(f"PSD–PDF  |  all {n_channels} channels")
+    ax_pdf.xaxis.set_major_locator(plt.LogLocator(base=10, numticks=10))
+    ax_pdf.tick_params(axis="x", which="minor", length=3)
+    ax_pdf.tick_params(axis="x", which="major", length=6)
+    fig.colorbar(pcm, ax=ax_pdf, pad=0.02, fraction=0.035).set_label("Probability")
+
+    # --- bottom: single-channel median PSD ---
+    ax_line.plot(freqs_masked, median_psd, color="#1f77b4", linewidth=1.0)
+    ax_line.set_xscale("log")
+    ax_line.set_xlim(fmin, fmax)
+    if ylim is not None:
+        ax_line.set_ylim(ylim)
+    ax_line.set_xlabel("Frequency (Hz)")
+    ax_line.set_ylabel("Power (dB)")
+    ax_line.set_title(f"Median PSD  |  channel {ch}")
+    ax_line.xaxis.set_major_locator(plt.LogLocator(base=10, numticks=10))
+    ax_line.tick_params(axis="x", which="minor", length=3)
+    ax_line.tick_params(axis="x", which="major", length=6)
+    ax_line.grid(True, which="both", alpha=0.3, linewidth=0.5)
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.show()
