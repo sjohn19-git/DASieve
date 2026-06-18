@@ -46,7 +46,9 @@ def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
     return picks, cft
 
 
-def _pick_ar(trace, f1, f2, lta_p, sta_p, lta_s, sta_s, m_p, m_s, l_p, l_s):
+def _pick_ar(
+    trace, f1, f2, lta_p, sta_p, lta_s, sta_s, m_p, m_s, l_p, l_s, s_pick=True
+):
     """AR-AIC P/S picks for one trace. Single-component DAS: the same channel
     data is passed for all three ar_pick components so that S picking stays
     enabled. Returns (list_of_pick_dicts, None)."""
@@ -68,6 +70,7 @@ def _pick_ar(trace, f1, f2, lta_p, sta_p, lta_s, sta_s, m_p, m_s, l_p, l_s):
         m_s,
         l_p,
         l_s,
+        s_pick=s_pick,
     )
 
     picks = []
@@ -204,6 +207,7 @@ def trigger_picker(
     l_s=0.2,
     plot=False,
     plot_channel=None,
+    s_pick=True,
 ):
     """Pick arrivals on a DAS patch.
 
@@ -227,7 +231,18 @@ def trigger_picker(
                 cft_plot = cft
         elif method == "ar":
             picks, _ = _pick_ar(
-                trace, f1, f2, lta_p, sta_p, lta_s, sta_s, m_p, m_s, l_p, l_s
+                trace,
+                f1,
+                f2,
+                lta_p,
+                sta_p,
+                lta_s,
+                sta_s,
+                m_p,
+                m_s,
+                l_p,
+                l_s,
+                s_pick=s_pick,
             )
         else:
             raise ValueError(f"unknown method: {method!r}")

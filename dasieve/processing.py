@@ -107,7 +107,7 @@ def decimate(
     """Decimate a DAS patch in time, space, or both.
 
     Args:
-        patch: DAS patch with shape (nt, nch).
+        patch: DAS patch. Dim order (time, distance) or (distance, time) both supported.
         target_fs: Target sampling rate in Hz. If provided, decimates in time.
         target_dx: Target channel spacing in metres. If provided, decimates in space.
         plot: If True, visualise decimation.
@@ -121,7 +121,11 @@ def decimate(
         raise ValueError("At least one of target_fs or target_dx must be provided")
 
     result = patch
-    stages = [(patch, f"Original ({patch.data.shape[1]} ch)")] if plot else None
+    stages = (
+        [(patch, f"Original ({patch.data.shape[patch.dims.index('distance')]} ch)")]
+        if plot
+        else None
+    )
 
     if target_fs is not None:
         current_fs = float(get_dim_sampling_rate(result, "time"))
@@ -167,12 +171,15 @@ def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.P
     nch = len(dist)
     n_trim = (nch // factor) * factor
     n_groups = n_trim // factor
+    dist_axis = patch.dims.index("distance")
 
     new_dist = dist[:n_trim].reshape(n_groups, factor).mean(axis=1)
     cols = []
 
     for i in range(n_groups):
-        sub_data = patch.data[:, i * factor : (i + 1) * factor]
+        idx = [slice(None), slice(None)]
+        idx[dist_axis] = slice(i * factor, (i + 1) * factor)
+        sub_data = patch.data[tuple(idx)]
         sub_dist = dist[i * factor : (i + 1) * factor]
         sub = patch.new(
             data=sub_data,
@@ -183,7 +190,7 @@ def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.P
         )
         cols.append(result.data)
 
-    stacked = np.column_stack(cols)  # (nt, n_groups)
+    stacked = np.stack(cols, axis=dist_axis)
     return patch.new(
         data=stacked,
         coords={"distance": new_dist, "time": patch.coords.get_array("time")},
@@ -198,11 +205,13 @@ def _plot_decimation(
     n = len(stages)
     colors = ["black", "red", "tab:blue"]
 
-    data0 = stages[0][0].data
-    nch = data0.shape[1]
+    patch0 = stages[0][0]
+    data0 = patch0.data
+    dist_axis0 = patch0.dims.index("distance")
+    nch = data0.shape[dist_axis0]
     ch = nch // 2 if channel is None else channel
-    orig_dist = stages[0][0].coords.get_array("distance")
-    t0 = stages[0][0].coords.get_array("time")[0]
+    orig_dist = patch0.coords.get_array("distance")
+    t0 = patch0.coords.get_array("time")[0]
     vmax = np.percentile(np.abs(data0), 99)
 
     fig, axes = plt.subplots(
@@ -218,16 +227,20 @@ def _plot_decimation(
     im = None
     for row, (patch, label) in enumerate(stages):
         d = patch.data
+        dist_axis = patch.dims.index("distance")
         time = patch.coords.get_array("time")
         t_s = (time - t0) / np.timedelta64(1, "s")
         dist = patch.coords.get_array("distance")
         ch_row = int(np.argmin(np.abs(dist - float(orig_dist[ch]))))
 
+        # imshow expects (distance, time) layout
+        plot_data = d if dist_axis == 0 else d.T
+
         ax_im = axes[row, 0]
         ax_tr = axes[row, 1]
 
         im = ax_im.imshow(
-            d.T,
+            plot_data,
             aspect="auto",
             cmap="RdBu_r",
             vmin=-vmax,
@@ -242,7 +255,9 @@ def _plot_decimation(
         if row == n - 1:
             ax_im.set_xlabel("Time (s)", fontsize=7)
 
-        ax_tr.plot(t_s, d[:, ch_row], lw=0.3, color=colors[row])
+        tr_idx = [slice(None), slice(None)]
+        tr_idx[dist_axis] = ch_row
+        ax_tr.plot(t_s, d[tuple(tr_idx)], lw=0.3, color=colors[row])
         ax_tr.set_title(f"Ch {ch_row} ({dist[ch_row]:.0f} m)", fontsize=8)
         ax_tr.set_ylabel("Amplitude", fontsize=7)
         ax_tr.tick_params(labelsize=6)

@@ -49,7 +49,7 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
     Parameters
     ----------
     patch : dc.Patch
-        Raw DASCore patch (time × channel layout).
+        Raw DASCore patch. Dim order (time, distance) or (distance, time) both supported.
 
     Returns
     -------
@@ -59,7 +59,9 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
         PSD in dB for each channel.
     """
     fs = get_dim_sampling_rate(patch, "time")
-    data = patch.data  # (n_time, n_channel)
+    data = np.array(patch.data, dtype=np.float32)
+    if patch.dims.index("time") != 0:
+        data = data.T
     n_t, n_ch = data.shape
 
     # nperseg: nearest power of 2 to fs/0.5
@@ -71,7 +73,7 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
         f"n_channels={n_ch}, n_samples={n_t}"
     )
 
-    data = scipy.signal.detrend(np.array(data, dtype=np.float32), type="linear", axis=0)
+    data = scipy.signal.detrend(data, type="linear", axis=0)
 
     freqs, Pxx = scipy.signal.welch(
         data,
@@ -209,12 +211,15 @@ def plot_patch(
     """
     Three-panel plot: waterfall | single-channel waveform | spectrogram.
 
-    Assumes patch.data shape is (n_time, n_ch) — dim 0 is time.
+    Dim order (time, distance) or (distance, time) both supported.
     Units label is fixed to strain rate (m/m/s).
     """
-    data = np.asarray(patch.data, dtype=np.float32)  # (n_time, n_ch)
+    data = np.asarray(patch.data, dtype=np.float32)
     time_arr = patch.coords.get_array("time")
     dist_arr = patch.coords.get_array(space_dim)
+    # Normalise to (n_time, n_ch) regardless of dim order in the patch
+    if patch.dims.index("time") != 0:
+        data = data.T
     t0 = time_arr[0]
     time_s = (time_arr - t0) / np.timedelta64(1, "s")
 
@@ -344,17 +349,24 @@ def plot_pdf(
     vmax: float | None = None,
     ylim: tuple | None = None,
     channel: int | None = None,
+    dimension: str = "distance",
 ) -> None:
     """
-    Two-row plot: 2-D PSD-PDF across all channels (top) and median PSD line
-    for one channel (bottom).
+    Two-row plot: 2-D PSD-PDF (top) and median PSD line (bottom).
 
     Parameters
     ----------
+    dimension : {"distance", "channel", "time"}
+        "distance" or "channel" — PDF built from all channels across the time
+        range (existing behaviour). "time" — PDF built from a single channel
+        across all time steps between t_start and t_end.
     ylim : tuple (ymin, ymax), optional
         Explicit y-axis limits in dB applied to both panels.
     channel : int, optional
-        Channel index for the line plot. Defaults to the mid channel.
+        Channel index. For dimension="distance"/"channel" this selects the
+        median-PSD line channel (defaults to mid channel). For
+        dimension="time" this selects which channel's PSDs to use (defaults
+        to mid channel).
     """
     df = pd.read_pickle(store_path)
 
@@ -367,8 +379,24 @@ def plot_pdf(
     freq_mask = (freqs >= fmin) & (freqs <= fmax)
     freqs_masked = freqs[freq_mask]
 
-    psd_matrix = np.vstack(df["psds"].to_numpy())  # (n_rows, n_freq)
-    psd_masked = psd_matrix[:, freq_mask]  # (n_rows, n_masked_freq)
+    n_channels = df["ch"].nunique()
+    ch = n_channels // 2 if channel is None else channel
+
+    if dimension in ("distance", "channel"):
+        # PDF uses every channel × every time step
+        psd_matrix = np.vstack(df["psds"].to_numpy())  # (n_rows, n_freq)
+        psd_masked = psd_matrix[:, freq_mask]
+        pdf_title = f"PSD–PDF  |  all {n_channels} channels"
+    else:  # "time"
+        # PDF uses only the selected channel across the time range
+        ch_rows = df[df["ch"] == ch]
+        psd_masked = np.vstack(ch_rows["psds"].to_numpy())[:, freq_mask]
+        t_label = ""
+        if t_start is not None or t_end is not None:
+            t0_str = str(pd.Timestamp(t_start))[:19] if t_start is not None else "start"
+            t1_str = str(pd.Timestamp(t_end))[:19] if t_end is not None else "end"
+            t_label = f"  |  {t0_str} → {t1_str}"
+        pdf_title = f"PSD–PDF  |  channel {ch}{t_label}"
 
     all_f = np.tile(freqs_masked, psd_masked.shape[0])
     all_p = psd_masked.ravel()
@@ -384,11 +412,9 @@ def plot_pdf(
     )
     H /= H.max()
 
-    n_channels = df["ch"].nunique()
-    ch = n_channels // 2 if channel is None else channel
-
-    ch_rows = df[df["ch"] == ch]
-    psd_ch = np.vstack(ch_rows["psds"].to_numpy())[:, freq_mask]
+    # Median PSD always uses the selected channel
+    ch_rows_med = df[df["ch"] == ch]
+    psd_ch = np.vstack(ch_rows_med["psds"].to_numpy())[:, freq_mask]
     median_psd = np.median(psd_ch, axis=0)
 
     fig, (ax_pdf, ax_line) = plt.subplots(
@@ -412,7 +438,7 @@ def plot_pdf(
         ax_pdf.set_ylim(ylim)
     ax_pdf.set_xlabel("Frequency (Hz)")
     ax_pdf.set_ylabel("Power (dB)")
-    ax_pdf.set_title(f"PSD–PDF  |  all {n_channels} channels")
+    ax_pdf.set_title(pdf_title)
     ax_pdf.xaxis.set_major_locator(plt.LogLocator(base=10, numticks=10))
     ax_pdf.tick_params(axis="x", which="minor", length=3)
     ax_pdf.tick_params(axis="x", which="major", length=6)

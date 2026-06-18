@@ -25,16 +25,16 @@ from obspy.signal.trigger import ar_pick
 # ar_pick parameters  — tuned for regional distances (~1000 km), 1–10 Hz band
 # ---------------------------------------------------------------------------
 AR_PARAMS = dict(
-    f1=1.0,  # lower corner for ar_pick's internal bandpass (Hz)
-    f2=10.0,  # upper corner (Hz) — lowered from 20 for regional waveforms
+    f1=1,  # lower corner for ar_pick's internal bandpass (Hz)
+    f2=7.0,  # upper corner (Hz)
     lta_p=5.0,  # LTA window for P picker (s)
     sta_p=0.5,  # STA window for P picker (s)
     lta_s=5.0,  # LTA window for S picker (s)
-    sta_s=1.0,  # STA window for S picker (s)
+    sta_s=0.5,  # STA window for S picker (s)
     m_p=2,
     m_s=8,
     l_p=0.5,  # pick refinement window for P (s)
-    l_s=1.0,  # pick refinement window for S (s)
+    l_s=0.5,  # pick refinement window for S (s)
 )
 
 # ---------------------------------------------------------------------------
