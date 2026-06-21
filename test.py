@@ -10,7 +10,6 @@ import os
 import glob
 import logging
 import dascore as dc
-from tqdm import tqdm
 import importlib
 import dasieve.qc
 import dasieve.processing
@@ -34,7 +33,7 @@ logging.basicConfig(
 
 
 h5_files = [
-    "/Users/sebinjohn/Downloads/16BConst_Stimulation_UTC_20240407_072054.163.h5"
+    "/home/sjohn/data/16BConst_Stimulation_UTC_20240407_072054.163.h5"
 ]
 patch = dc.spool(h5_files[0])[0]
 patch = patch.select(distance=(0, 3000))
@@ -70,11 +69,11 @@ patch = cmd_remove(patch, dim="distance", window=5000, method="median")
 # plot_patch(patch)
 
 
-source_file = h5_files[0]
+# source_file = h5_files[0]
 
-df_trig = trigger_picker(
-    patch, sta=0.3, lta=2.0, thr_on=4.0, thr_off=1, plot=False, plot_channel=None
-)
+# df_trig = trigger_picker(
+#     patch, sta=0.3, lta=2.0, thr_on=4.0, thr_off=1, plot=False, plot_channel=None
+# )
 # save_picks(df_trig, file_name=source_file, author="trigger")
 
 # df_ar = trigger_picker(
@@ -99,95 +98,48 @@ df_trig = trigger_picker(
 
 # save_picks(df_ar, file_name=source_file, author="ar")
 
-df_pn = pick_phasenet(patch, min_prob=0.3, plot=True, plot_channel=None)
+df_pn = pick_phasenet(patch, min_prob=0.3, plot=True, plot_channel=280)
+
 save_picks(df_pn, file_name=source_file, author="phasenet")
 
 
 ########
 
-input_dir = "/Volumes/Elements"
-batch_files = sorted(glob.glob(os.path.join(input_dir, "07", "*.h5"), recursive=True))[
-    :20
-]
-save_dir = os.path.expanduser("~/Downloads")
-store_path = os.path.join(save_dir, "psd_qc.pkl")
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+h5_loc = "/mnt/nas3/sjohn/data/utah_forge/raw_data/das/16b/2024_04_stimulation/07"
+results_dir = "/mnt/nas3/sjohn/results"
+os.makedirs(results_dir, exist_ok=True)
+
+batch_files = sorted(glob.glob(os.path.join(h5_loc, "**", "*.h5"), recursive=True))[:100]
 if not batch_files:
-    logging.warning("No .h5 files found in %s", input_dir)
+    logging.warning("No .h5 files found in %s", h5_loc)
 else:
-    logging.info("Found %d .h5 files — starting batch", len(batch_files))
-    for h5_path in tqdm(batch_files, desc="PSD batch", unit="file"):
-        logging.info("Processing %s", os.path.basename(h5_path))
+    logging.info("Found %d .h5 files to process", len(batch_files))
+    for source_file in batch_files:
+        stem = os.path.splitext(os.path.basename(source_file))[0]
+        logging.info("Processing %s", stem)
         try:
-            patch = dc.spool(h5_path)[0]
+            patch = dc.spool(source_file)[0]
             patch = patch.select(distance=(0, 3000))
             patch = normalize_patch(patch)
-            freqs, psd_db = compute_psd(patch)
-            timestamp = patch.coords.min("time")
-            append_to_store(store_path, timestamp, freqs, psd_db)
+            patch = decimate(
+                patch, target_fs=500, target_dx=5, plot=False,
+                lateral_stacking=False, pws_power=2,
+            )
+            patch = cmd_remove(patch, dim="distance", window=5000, method="median")
+
+            df_pn = pick_phasenet(patch, min_prob=0.3, plot=True, plot_channel=None)
+
+            save_path = os.path.join(results_dir, f"{stem}_phasenet.png")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close("all")
+            logging.info("  plot saved: %s", save_path)
+
         except Exception:
-            logging.exception("Failed on %s — skipping", os.path.basename(h5_path))
+            logging.exception("Failed on %s — skipping", stem)
+            continue
 
-    # Plot 1: PDF across all channels (distance dimension)
-    plot_pdf(
-        store_path=store_path,
-        out_path=os.path.join(save_dir, "psd_pdf_distance.png"),
-        vmax=0.8,
-        dimension="distance",
-    )
-
-    # Plot 2: PDF for mid channel across time
-    plot_pdf(
-        store_path=store_path,
-        out_path=os.path.join(save_dir, "psd_pdf_time.png"),
-        vmax=0.8,
-        dimension="time",
-    )
-
-    print(f"Store  : {store_path}")
-    print(f"Plots  : {save_dir}/psd_pdf_distance.png, psd_pdf_time.png")
-
-
-import pandas as pd
-
-df = pd.read_pickle(store_path)
-
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import numpy as np
-
-mid_ch = df["ch"].max() // 2
-ch_df = df[df["ch"] == mid_ch].sort_values("time").reset_index(drop=True)
-
-times = ch_df["time"].values
-n = len(times)
-colors = cm.turbo(np.linspace(0, 1, n))
-
-freqs = ch_df["freqs"].iloc[0]
-fmin, fmax = 1.0, 250.0
-freq_mask = (freqs >= fmin) & (freqs <= fmax)
-freqs_masked = freqs[freq_mask]
-
-fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
-
-for i, (_, row) in enumerate(ch_df.iterrows()):
-    ax.plot(
-        freqs_masked, row["psds"][freq_mask], color=colors[i], linewidth=0.6, alpha=0.7
-    )
-
-sm = plt.cm.ScalarMappable(cmap="turbo", norm=plt.Normalize(vmin=0, vmax=n - 1))
-sm.set_array([])
-cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.03)
-cbar.set_label("Time index")
-cbar.set_ticks([0, n - 1])
-cbar.set_ticklabels([str(times[0])[:19], str(times[-1])[:19]])
-
-ax.set_xscale("log")
-ax.set_xlim(fmin, fmax)
-ax.set_xlabel("Frequency (Hz)")
-ax.set_ylabel("Power (dB)")
-ax.set_title(f"PSD — channel {mid_ch} — all {n} time steps")
-ax.xaxis.set_major_locator(plt.LogLocator(base=10, numticks=10))
-ax.grid(True, which="both", alpha=0.25, linewidth=0.4)
-plt.tight_layout()
-plt.show()
+    logging.info("Batch done.")

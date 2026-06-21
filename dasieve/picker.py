@@ -81,7 +81,7 @@ def _pick_ar(
     return picks, None
 
 
-def _plot_picks(patch, stream, df, ch_idx, cft_plot, thr_on, thr_off):
+def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
     """Single plotting routine used for every method. Plots P/S picks when
     present, otherwise trigger onsets."""
     import matplotlib.pyplot as plt
@@ -137,7 +137,7 @@ def _plot_picks(patch, stream, df, ch_idx, cft_plot, thr_on, thr_off):
     ax_img.legend(loc="upper right", fontsize=8)
 
     # --- middle: selected channel waveform ---
-    ax_trace.plot(t_sec, stream[ch_idx].data, color="black", linewidth=0.6)
+    ax_trace.plot(t_sec, data_dt[ch_idx], color="black", linewidth=0.6)
     ch_picks = df[df["distance"] == dist_vals[ch_idx]]
     for _, row in ch_picks.iterrows():
         phase = row["phase"]
@@ -270,7 +270,7 @@ def trigger_picker(
     )
 
     if plot:
-        _plot_picks(patch, stream, df, ch_idx, cft_plot, thr_on, thr_off)
+        _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off)
 
     return df
 
@@ -335,6 +335,7 @@ def pick_phasenet(
     phases=("P", "S"),
     highpass_filter=0.0,
     cut_patch=False,
+    batch_size=1,
     work_dir=None,
     keep_files=False,
     plot=False,
@@ -359,6 +360,9 @@ def pick_phasenet(
     phases : phase labels the model outputs, default ("P", "S").
     highpass_filter : EQNet highpass corner in Hz (0.0 = no filter).
     cut_patch : tile very large patches into EQNet patches before predicting.
+    batch_size : number of tiles processed per GPU step. Only has effect when
+        cut_patch=True (a single un-tiled patch is always batch 1). Increase
+        on GPUs with more VRAM until you hit OOM; has no effect on CPU speed.
     work_dir : staging directory; a temp dir is used (and cleaned) if None.
     keep_files : if True, keep the staged h5 / results instead of deleting them.
 
@@ -400,7 +404,7 @@ def pick_phasenet(
     args.data_list = files_list
     args.result_path = result_dir
     args.format = "h5"
-    args.batch_size = 1
+    args.batch_size = batch_size if cut_patch else 1
     args.workers = 0
     args.device = device
     args.min_prob = min_prob
@@ -438,9 +442,9 @@ def pick_phasenet(
         shutil.rmtree(work_dir, ignore_errors=True)
 
     if plot:
-        stream = patch_to_obspy(patch)
-        ch_idx = plot_channel if plot_channel is not None else len(stream) // 2
-        _plot_picks(patch, stream, df, ch_idx, None, None, None)
+        n_ch = len(patch.coords.get_array("distance"))
+        ch_idx = plot_channel if plot_channel is not None else n_ch // 2
+        _plot_picks(patch, df, ch_idx, None, None, None)
 
     return df
 
