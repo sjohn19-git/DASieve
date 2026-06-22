@@ -19,6 +19,7 @@ def cmd_remove(
     window: float | None = None,
     samples: bool = False,
     method: str = "median",
+    plot: bool = False,
 ) -> dc.Patch:
     """Remove common-mode noise by block-wise median subtraction along ``dim``.
 
@@ -34,53 +35,41 @@ def cmd_remove(
         window: Block size in physical units (metres for distance, seconds for
             time), or in samples if ``samples=True``. None uses the full dim.
         samples: If True, treat ``window`` as a sample/channel count.
+        plot: If True, show the qc.plot_patch diagnostic of the result.
 
     Returns:
         Patch with block-wise common mode removed (same shape and coords as input).
     """
-    if method == "median":
-        coords = patch.coords.get_array(dim)
-        n = len(coords)
-        dim_axis = patch.dims.index(dim)
+    if method not in ("median", "stack"):
+        raise ValueError(
+            f"unknown method {method!r}; expected 'median' or 'stack'"
+        )
 
-        if window is None:
-            block_size = n
-        elif samples:
-            block_size = max(1, int(window))
-        else:
-            fs = float(get_dim_sampling_rate(patch, dim))
-            block_size = max(1, round(window * fs))
+    n = len(patch.coords.get_array(dim))
+    dim_axis = patch.dims.index(dim)
 
-        data = patch.data.copy()
-        for start in range(0, n, block_size):
-            end = min(start + block_size, n)
-            idx = [slice(None), slice(None)]
-            idx[dim_axis] = slice(start, end)
-            block = data[tuple(idx)]
-            common_mode = np.median(block, axis=dim_axis, keepdims=True)
-            data[tuple(idx)] -= common_mode
-    elif method == "stack":
-        coords = patch.coords.get_array(dim)
-        n = len(coords)
-        dim_axis = patch.dims.index(dim)
-        other_dim = next(d for d in patch.dims if d != dim)
+    if window is None:
+        block_size = n
+    elif samples:
+        block_size = max(1, int(window))
+    else:
+        fs = float(get_dim_sampling_rate(patch, dim))
+        block_size = max(1, round(window * fs))
 
-        if window is None:
-            block_size = n
-        elif samples:
-            block_size = max(1, int(window))
-        else:
-            fs = float(get_dim_sampling_rate(patch, dim))
-            block_size = max(1, round(window * fs))
+    data = patch.data.copy()
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        idx = [slice(None), slice(None)]
+        idx[dim_axis] = slice(start, end)
 
-        data = patch.data.copy()
-        for start in range(0, n, block_size):
-            end = min(start + block_size, n)
-            idx = [slice(None), slice(None)]
-            idx[dim_axis] = slice(start, end)
-            sub_data = data[tuple(idx)]
+        if method == "median":
+            common_mode = np.median(
+                data[tuple(idx)], axis=dim_axis, keepdims=True
+            )
+        else:  # "stack"
+            other_dim = next(d for d in patch.dims if d != dim)
             sub_patch = patch.new(
-                data=sub_data,
+                data=data[tuple(idx)],
                 coords={
                     dim: patch.coords.get_array(dim)[start:end],
                     other_dim: patch.coords.get_array(other_dim),
@@ -90,9 +79,17 @@ def cmd_remove(
                 stack_dim=dim, power=0, dim_reduce="squeeze"
             )
             common_mode = np.expand_dims(mean_patch.data, axis=dim_axis)
-            data[tuple(idx)] -= common_mode
 
-    return patch.new(data=data)
+        data[tuple(idx)] -= common_mode
+
+    result = patch.new(data=data)
+
+    if plot:
+        from .qc import plot_patch
+
+        plot_patch(result, show=True)
+
+    return result
 
 
 def decimate(

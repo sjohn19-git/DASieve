@@ -18,6 +18,7 @@ Store layout (psd_qc.pkl) — pandas DataFrame:
 Authors: Sebin John, 2025
 """
 
+import os
 import logging
 from pathlib import Path
 from dascore.utils.patch import get_dim_sampling_rate
@@ -32,12 +33,24 @@ import dascore as dc
 log = logging.getLogger(__name__)
 
 
+# Default PSD store location — same directory as the picks catalog
+# (~/DASieve). Single source of truth; callers override only when needed.
+DEFAULT_PSD_STORE = os.path.join(os.path.expanduser("~/DASieve"), "psd_qc.pkl")
+
+
 # ---------------------------------------------------------------------------
 # PSD computation
 # ---------------------------------------------------------------------------
 
 
-def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
+def compute_psd(
+    patch: dc.Patch,
+    append: bool = True,
+    plot: bool = False,
+    store_path: str = DEFAULT_PSD_STORE,
+    timestamp=None,
+    **plot_kwargs,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute per-channel Welch PSD from a DASCore patch.
 
@@ -50,6 +63,20 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
     ----------
     patch : dc.Patch
         Raw DASCore patch. Dim order (time, distance) or (distance, time) both supported.
+    append : bool
+        If True (default), append this PSD to the pickle store at ``store_path``
+        before plotting, so the current patch is included in the PDF. If False,
+        the store is left untouched (the current run is excluded from the plot).
+    plot : bool
+        If True, render the PSD-PDF diagnostic from the store (see ``_plot_pdf``).
+    store_path : str
+        Pickle store path. Defaults to ``DEFAULT_PSD_STORE`` (~/DASieve/psd_qc.pkl).
+    timestamp : datetime-like, optional
+        UTC start time used when appending. Defaults to the patch start time.
+    **plot_kwargs
+        Forwarded to ``_plot_pdf`` when plot=True: fmin, fmax, vmin, vmax, ylim,
+        channel, dimension, t_start, t_end, p_min, p_max, bins. See ``_plot_pdf``
+        for defaults.
 
     Returns
     -------
@@ -85,6 +112,14 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
         axis=0,
     )
     psd_db = (10.0 * np.log10(np.maximum(Pxx, 1e-30))).astype(np.float32)
+
+    if append:
+        ts = patch.coords.min("time") if timestamp is None else timestamp
+        _append_to_store(ts, freqs, psd_db, store_path=store_path)
+
+    if plot:
+        _plot_pdf(store_path=store_path, **plot_kwargs)
+
     return freqs, psd_db
 
 
@@ -93,11 +128,11 @@ def compute_psd(patch: dc.Patch) -> tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 
-def append_to_store(
-    store_path: str,
+def _append_to_store(
     timestamp: np.datetime64,
     frequencies: np.ndarray,
     psd_db: np.ndarray,
+    store_path: str = DEFAULT_PSD_STORE,
 ) -> None:
     """
     Append one PSD time step to the pandas pickle store.
@@ -107,14 +142,15 @@ def append_to_store(
 
     Parameters
     ----------
-    store_path : str
-        Path to the pickle file (created if it does not exist).
     timestamp : np.datetime64
         UTC start time of the processed file.
     frequencies : np.ndarray, shape (n_freq,)
         Frequency vector in Hz.
     psd_db : np.ndarray, shape (n_freq, n_channel), float32
         PSD in dB to append.
+    store_path : str
+        Path to the pickle file (created if it does not exist). Defaults to
+        ``DEFAULT_PSD_STORE`` (~/DASieve/psd_qc.pkl).
     """
     store_path = str(store_path)
     Path(store_path).parent.mkdir(parents=True, exist_ok=True)
@@ -335,9 +371,8 @@ def plot_patch(
 # ---------------------------------------------------------------------------
 
 
-def plot_pdf(
-    store_path: str,
-    out_path: str,
+def _plot_pdf(
+    store_path: str = DEFAULT_PSD_STORE,
     t_start=None,
     t_end=None,
     p_min: float | None = None,
@@ -349,7 +384,7 @@ def plot_pdf(
     vmax: float | None = None,
     ylim: tuple | None = None,
     channel: int | None = None,
-    dimension: str = "distance",
+    dimension: str = "time",
 ) -> None:
     """
     Two-row plot: 2-D PSD-PDF (top) and median PSD line (bottom).
@@ -459,7 +494,4 @@ def plot_pdf(
     ax_line.grid(True, which="both", alpha=0.3, linewidth=0.5)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
     plt.show()
-    plt.close()
-    log.info("Saved: %s", out_path)

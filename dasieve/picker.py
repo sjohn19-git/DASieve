@@ -25,6 +25,20 @@ PICK_COLUMNS = [
 ]
 
 
+def _save_to_catalog(df, file_name, author, db_path=None):
+    """Persist picks to the SQLite catalog. Imported lazily to avoid a
+    circular import (dasieve.catalog imports PICK_COLUMNS from this module)."""
+    if file_name is None:
+        raise ValueError(
+            "db_save=True requires file_name (the source data file). "
+            "Pass file_name=... or db_save=False."
+        )
+    from .catalog import save_picks
+
+    kwargs = {} if db_path is None else {"db_path": db_path}
+    return save_picks(df, file_name=file_name, author=author, **kwargs)
+
+
 def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
     """STA/LTA trigger picks for one trace. Returns (list_of_pick_dicts, cft)."""
     fs = trace.stats.sampling_rate
@@ -208,12 +222,20 @@ def trigger_picker(
     plot=False,
     plot_channel=None,
     s_pick=True,
+    file_name=None,
+    db_save=True,
+    db_path=None,
 ):
     """Pick arrivals on a DAS patch.
 
     method : "sta_lta" (classic STA/LTA + trigger_onset) or
              "ar" (AR-AIC P/S picker; single-component data is passed for all
              three ar_pick components).
+
+    db_save : if True (default), the picks are persisted to the SQLite catalog
+        via :func:`dasieve.catalog.save_picks`. Requires ``file_name``. The
+        catalog ``author`` is the picking ``method`` (e.g. "sta_lta" or "ar").
+        ``db_path`` overrides the default catalog location.
     """
     stream = patch_to_obspy(patch)
     dist_vals = patch.coords.get_array("distance")
@@ -271,6 +293,9 @@ def trigger_picker(
 
     if plot:
         _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off)
+
+    if db_save:
+        _save_to_catalog(df, file_name=file_name, author=method, db_path=db_path)
 
     return df
 
@@ -340,6 +365,9 @@ def pick_phasenet(
     keep_files=False,
     plot=False,
     plot_channel=None,
+    file_name=None,
+    db_save=True,
+    db_path=None,
 ):
     """PhaseNet-DAS picks on a DAS patch, returned in the shared PICK_COLUMNS
     schema (same as ``trigger_picker``).
@@ -445,6 +473,9 @@ def pick_phasenet(
         n_ch = len(patch.coords.get_array("distance"))
         ch_idx = plot_channel if plot_channel is not None else n_ch // 2
         _plot_picks(patch, df, ch_idx, None, None, None)
+
+    if db_save:
+        _save_to_catalog(df, file_name=file_name, author="phasenet", db_path=db_path)
 
     return df
 
