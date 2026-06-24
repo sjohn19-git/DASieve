@@ -1,0 +1,62 @@
+Metadata-Version: 2.4
+Name: dasieve
+Version: 0.1.0
+Summary: DAS processing, QC and phase picking pipeline built on dascore.
+Author-email: Sebin John <sebinjohn0007@gmail.com>
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: dascore
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: h5py
+Requires-Dist: obspy
+Requires-Dist: torch
+Requires-Dist: seisbench
+Requires-Dist: xdas
+
+# DASieve
+
+DAS (Distributed Acoustic Sensing) processing, QC and phase-picking pipeline
+built on [dascore](https://dascore.org).
+
+## Install
+
+```bash
+# installs everything (processing, QC, all pickers including the DL backends)
+pip install -e .
+
+# PhaseNet-DAS additionally needs the vendored EQNet submodule:
+git submodule update --init --recursive
+```
+
+Requires Python >= 3.10.
+
+## Usage
+
+```python
+import dascore as dc
+import dasieve as sieve
+
+patch = dc.spool("event.h5")[0].select(distance=(0, 3000))
+patch = sieve.processing.to_strain_rate(patch)
+patch = sieve.processing.decimate(patch, target_fs=500, target_dx=5)
+patch = sieve.processing.cmd_remove(patch, dim="distance", window=5000)
+
+# pickers (all return the shared PICK_COLUMNS schema, persisted to a SQLite catalog)
+sieve.picker.trigger_picker(patch, method="ar", file_name="event.h5")
+sieve.picker.phasenet_picker(patch, min_prob=0.3, file_name="event.h5")   # EQNet 2-D PhaseNet-DAS
+sieve.picker.seisbench_picker(patch, model="eqtransformer", file_name="event.h5")
+```
+
+## Package layout
+
+| Submodule            | Purpose                                              |
+|----------------------|------------------------------------------------------|
+| `dasieve.processing` | `to_strain_rate`, `decimate`, `cmd_remove`           |
+| `dasieve.qc`         | `compute_psd`, `plot_patch`                           |
+| `dasieve.picker`     | `trigger_picker`, `phasenet_picker`, `seisbench_picker` |
+| `dasieve.catalog`    | SQLite pick catalog (`save_picks`, `load_picks`)     |
+| `dasieve.geometry`   | survey geometry attachment                           |
+| `dasieve.watcher`    | directory watcher for streaming ingest               |

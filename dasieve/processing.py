@@ -5,7 +5,13 @@ from dascore.units import m
 import dascore as dc
 
 
-def normalize_patch(patch: dc.Patch, target_dx_m: float = 5.0) -> dc.Patch:
+def to_strain_rate(patch: dc.Patch, target_dx_m: float = 5.0) -> dc.Patch:
+    """Convert raw DAS counts to strain rate (m/m/s).
+
+    This is an amplitude/unit calibration -- it scales the raw interrogator
+    counts to physical strain rate using the gauge length and sampling rate --
+    not a statistical normalization.
+    """
     fs = float(get_dim_sampling_rate(patch, "time"))
     gl = patch.attrs.gauge_length * m
     scale_factor = 1 / 8192

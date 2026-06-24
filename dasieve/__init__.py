@@ -1,12 +1,9 @@
 # dasieve/__init__.py
-from .watcher import watch_directory
-from .geometry import load_survey, attach_geometry
-from .qc import compute_psd, plot_patch
-from .picker import (
-    trigger_picker,
-    phasenet_picker,
-    seisbench_picker,
-    eqtransformer_picker,
-    PICK_COLUMNS,
-)
-from .catalog import save_picks, load_picks, init_db
+#
+# Submodules are the public namespace. Reach functions through them, e.g.
+#   import dasieve as sieve
+#   sieve.qc.compute_psd(patch)
+#   sieve.picker.seisbench_picker(patch, model="eqtransformer")
+from . import qc, picker, processing, catalog, geometry, watcher
+
+__all__ = ["qc", "picker", "processing", "catalog", "geometry", "watcher"]

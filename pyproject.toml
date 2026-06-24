@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dasieve"
+version = "0.1.0"
+description = "DAS processing, QC and phase picking pipeline built on dascore."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Sebin John", email = "sebinjohn0007@gmail.com" }]
+
+# Runtime dependencies (everything is installed in one shot).
+# NOTE: PhaseNet-DAS also needs the vendored EQNet submodule:
+#   git submodule update --init --recursive
+dependencies = [
+    "dascore",
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "h5py",
+    "obspy",        # STA/LTA + AR-AIC pickers
+    "torch",        # backend for the deep-learning pickers
+    "seisbench",    # SeisBench pickers on DAS (seisbench_picker)
+    "xdas",         # DAS data array for DASWaveformModelWrapper
+]
+
+[tool.setuptools.packages.find]
+# Current (flat) layout: the package is dasieve/ at the repo root. The vendored
+# EQNet submodule is imported by file path at runtime, not as a dasieve
+# subpackage, so it is excluded from package discovery.
+where = ["."]
+include = ["dasieve*"]
+exclude = ["dasieve.EQNet*", "EQNet*"]

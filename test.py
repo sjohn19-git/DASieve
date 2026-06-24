@@ -4,26 +4,18 @@ Batch PSD QC for all .h5 files in an input directory.
 Run:
     python test.py
 """
+#%%
+%load_ext autoreload
+%autoreload 2
 
-import sys
 import os
 import glob
 import logging
+
 import dascore as dc
-import importlib
-import dasieve.qc
-import dasieve.processing
-import dasieve.picker
+import dasieve as sieve
 
-importlib.reload(dasieve.qc)
-importlib.reload(dasieve.processing)
-importlib.reload(dasieve.picker)
 
-from dasieve.qc import compute_psd, plot_patch
-from dasieve.processing import normalize_patch, decimate, cmd_remove
-from dasieve.picker import trigger_picker, phasenet_picker, seisbench_picker
-
-sys.path.insert(0, os.path.expanduser("~/DASieve"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,16 +28,19 @@ source_file = h5_files[0]
 
 patch = dc.spool(source_file)[0]
 patch = patch.select(distance=(0, 3000))
-patch = normalize_patch(patch)
-patch = decimate(
+patch = sieve.processing.to_strain_rate(patch)
+patch = sieve.processing.cmd_remove(
+    patch, dim="distance", window=5000, method="median", plot=True
+)
+patch = sieve.processing.decimate(
     patch, target_fs=500, target_dx=5, plot=True, lateral_stacking=True, pws_power=0
 )
-freqs, psd_db = compute_psd(patch, plot=True, vmax=0.8, ylim=(-160, -132.5))
-
-patch = cmd_remove(patch, dim="distance", window=5000, method="median", plot=True)
+freqs, psd_db = sieve.qc.compute_psd(patch, plot=True, vmax=0.8, ylim=(-160, -132.5))
 
 
-df_trig = trigger_picker(
+
+
+df_trig = sieve.picker.trigger_picker(
     patch,
     sta=0.3,
     lta=2.0,
@@ -56,7 +51,7 @@ df_trig = trigger_picker(
     file_name=source_file,
 )
 
-# df_ar = trigger_picker(
+# df_ar = sieve.picker.trigger_picker(
 #     patch,
 #     method="ar",
 #     f1=100.0,
@@ -75,15 +70,15 @@ df_trig = trigger_picker(
 #     file_name=source_file,
 # )
 
-df_pn = phasenet_picker(
+df_pn = sieve.picker.phasenet_picker(
     patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
 )
 
 # EQTransformer (SeisBench) on the same patch, visualized with the shared
 # picker plotter. device auto-detects MPS on Apple Silicon.
-df_eqt = seisbench_picker(
+df_eqt = sieve.picker.seisbench_picker(
     patch,
-    model="phasenet",
+    model="eqtransformer",
     pretrained="original",
     min_prob=0.3,
     plot=True,
@@ -93,6 +88,10 @@ df_eqt = seisbench_picker(
 
 
 ########
+
+
+
+
 
 import matplotlib
 
@@ -116,8 +115,8 @@ else:
         try:
             patch = dc.spool(source_file)[0]
             patch = patch.select(distance=(0, 3000))
-            patch = normalize_patch(patch)
-            patch = decimate(
+            patch = sieve.processing.to_strain_rate(patch)
+            patch = sieve.processing.decimate(
                 patch,
                 target_fs=500,
                 target_dx=5,
@@ -125,9 +124,11 @@ else:
                 lateral_stacking=False,
                 pws_power=2,
             )
-            patch = cmd_remove(patch, dim="distance", window=5000, method="median")
+            patch = sieve.processing.cmd_remove(
+                patch, dim="distance", window=5000, method="median"
+            )
 
-            df_pn = phasenet_picker(
+            df_pn = sieve.picker.phasenet_picker(
                 patch, min_prob=0.3, plot=True, plot_channel=None, file_name=source_file
             )
 

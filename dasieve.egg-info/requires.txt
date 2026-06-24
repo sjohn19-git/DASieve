@@ -1,0 +1,10 @@
+dascore
+numpy
+pandas
+scipy
+matplotlib
+h5py
+obspy
+torch
+seisbench
+xdas
