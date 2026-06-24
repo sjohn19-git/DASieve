@@ -21,7 +21,7 @@ importlib.reload(dasieve.picker)
 
 from dasieve.qc import compute_psd, plot_patch
 from dasieve.processing import normalize_patch, decimate, cmd_remove
-from dasieve.picker import trigger_picker, pick_phasenet
+from dasieve.picker import trigger_picker, phasenet_picker, seisbench_picker
 
 sys.path.insert(0, os.path.expanduser("~/DASieve"))
 
@@ -30,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 h5_files = [
-    "/Users/sebinjohn/Downloads/16BConst_Stimulation_UTC_20240407_072054.163.h5"
+    "/Users/sj201/Downloads/16BConst_Stimulation_UTC_20240407_072054.163.h5"
 ]
 source_file = h5_files[0]
 
@@ -56,27 +56,39 @@ df_trig = trigger_picker(
     file_name=source_file,
 )
 
-df_ar = trigger_picker(
-    patch,
-    method="ar",
-    f1=100.0,
-    f2=200.0,
-    lta_p=3,
-    sta_p=0.03,
-    lta_s=3,
-    sta_s=0.03,
-    m_p=2,
-    m_s=2,
-    l_p=0.03,
-    l_s=0.03,
-    plot=True,
-    plot_channel=200,
-    s_pick=False,
-    file_name=source_file,
+# df_ar = trigger_picker(
+#     patch,
+#     method="ar",
+#     f1=100.0,
+#     f2=200.0,
+#     lta_p=3,
+#     sta_p=0.03,
+#     lta_s=3,
+#     sta_s=0.03,
+#     m_p=2,
+#     m_s=2,
+#     l_p=0.03,
+#     l_s=0.03,
+#     plot=True,
+#     plot_channel=200,
+#     s_pick=False,
+#     file_name=source_file,
+# )
+
+df_pn = phasenet_picker(
+    patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
 )
 
-df_pn = pick_phasenet(
-    patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
+# EQTransformer (SeisBench) on the same patch, visualized with the shared
+# picker plotter. device auto-detects MPS on Apple Silicon.
+df_eqt = seisbench_picker(
+    patch,
+    model="phasenet",
+    pretrained="original",
+    min_prob=0.3,
+    plot=True,
+    plot_channel=280,
+    file_name=source_file,
 )
 
 
@@ -115,7 +127,7 @@ else:
             )
             patch = cmd_remove(patch, dim="distance", window=5000, method="median")
 
-            df_pn = pick_phasenet(
+            df_pn = phasenet_picker(
                 patch, min_prob=0.3, plot=True, plot_channel=None, file_name=source_file
             )
 

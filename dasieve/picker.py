@@ -25,6 +25,19 @@ PICK_COLUMNS = [
 ]
 
 
+def _auto_device():
+    """Pick the best available torch device: CUDA (NVIDIA) > MPS (Apple
+    Silicon) > CPU. Imported lazily so torch is only required when a
+    deep-learning picker actually runs."""
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _save_to_catalog(df, file_name, author, db_path=None):
     """Persist picks to the SQLite catalog. Imported lazily to avoid a
     circular import (dasieve.catalog imports PICK_COLUMNS from this module)."""
@@ -352,7 +365,7 @@ def _patch_to_eqnet_h5(patch, h5_path):
     return dist_vals, time_vals
 
 
-def pick_phasenet(
+def phasenet_picker(
     patch,
     eqnet_dir=DEFAULT_EQNET_DIR,
     min_prob=0.3,
@@ -406,7 +419,7 @@ def pick_phasenet(
     predict = _import_eqnet_predict(eqnet_dir)
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = _auto_device()
 
     owns_dir = work_dir is None
     work_dir = work_dir or tempfile.mkdtemp(prefix="phasenet_das_")
@@ -514,3 +527,255 @@ def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time):
     if not df.empty:
         df.sort_values(["distance", "onset_sample"], inplace=True, ignore_index=True)
     return df
+
+
+# ---------------------------------------------------------------------------
+# SeisBench models on DAS (generic wrapper)
+# ---------------------------------------------------------------------------
+# SeisBench ships single-station phase pickers (PhaseNet, EQTransformer, ...)
+# plus an *experimental* DAS API, DASWaveformModelWrapper, that applies any
+# of them to DAS data channel-by-channel. ``seisbench_picker`` wraps that:
+# choose any SeisBench model, run it on a dascore patch, get picks back in the
+# shared PICK_COLUMNS schema.
+#
+# IMPORTANT scope notes:
+#   * The wrapper only accepts models whose ``output_type == "array"`` (it
+#     reads the dense probability curves). That is PhaseNet / EQTransformer and
+#     their relatives; point-output models like GPD are NOT supported.
+#   * Each channel is treated independently (no spatial coherence). This is a
+#     *different, generally weaker* approach than the dedicated 2-D PhaseNet-DAS
+#     model in EQNet (see ``phasenet_picker``); it does not replace it.
+#
+# Requires the optional dependencies ``seisbench`` and ``xdas`` (imported
+# lazily, like ``torch`` in ``phasenet_picker``).
+
+# Friendly name -> SeisBench class name. ``model=`` may also be a pre-built
+# SeisBench model instance, bypassing this table.
+_SEISBENCH_MODELS = {
+    "eqtransformer": "EQTransformer",
+    "phasenet": "PhaseNet",
+    "phasenetlight": "PhaseNetLight",
+    "variablelengthphasenet": "VariableLengthPhaseNet",
+    "obstransformer": "OBSTransformer",
+    "skynet": "Skynet",
+}
+
+
+def _patch_to_xdas(patch):
+    """Convert a dascore patch into the ``xdas.DataArray`` the SeisBench DAS
+    API expects, keeping the patch's native dim order (the wrapper accepts both
+    ("time", "distance") and ("distance", "time")). The time axis gets an
+    interpolated coord; distance a dense one.
+
+    Returns (data_array, dist_vals, time_vals, fs, t0_ns)."""
+    import xdas
+
+    dist_vals = patch.coords.get_array("distance")
+    time_vals = patch.coords.get_array("time")
+
+    nt = len(time_vals)
+    dt_s = float(np.median(np.diff(time_vals)) / np.timedelta64(1, "s"))
+    fs = 1.0 / dt_s
+    t0 = np.datetime64(pd.Timestamp(time_vals[0]).to_pydatetime())
+    t1 = np.datetime64(pd.Timestamp(time_vals[-1]).to_pydatetime())
+    t0_ns = time_vals[0].astype("datetime64[ns]").astype("int64")
+
+    time_coord = {"tie_indices": [0, nt - 1], "tie_values": [t0, t1]}
+    dist_coord = np.asarray(dist_vals, dtype=float)
+
+    # Build coords in the patch's own dim order -> no transpose, no assumption
+    # about whether the patch is (time, distance) or (distance, time).
+    coords = {
+        d: (time_coord if d == "time" else dist_coord) for d in patch.dims
+    }
+    data = np.ascontiguousarray(patch.data, dtype=np.float32)
+
+    da = xdas.DataArray(data=data, coords=coords)
+    return da, dist_vals, time_vals, fs, t0_ns
+
+
+def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time):
+    """Map SeisBench ``DASPick`` objects (time=datetime64, channel=<distance
+    coord value>, confidence, phase) into the shared PICK_COLUMNS schema.
+
+    ``channel`` is snapped to the nearest distance value and the pick time to
+    the nearest sample index so the result drops into PICK_COLUMNS and the
+    shared ``_plot_picks`` channel-equality logic keeps working."""
+    n_dist = len(dist_vals)
+    dist_arr = np.asarray(dist_vals, dtype=float)
+
+    rows = []
+    for p in picks:
+        # snap channel coordinate -> nearest channel index
+        ch = int(np.argmin(np.abs(dist_arr - float(p.channel))))
+        if ch < 0 or ch >= n_dist:
+            continue
+
+        peak_ns = pd.Timestamp(np.datetime64(p.time)).value
+        smp = int(round((peak_ns - t0_ns) * 1e-9 * fs))
+        if smp < 0 or smp >= n_time:
+            continue
+
+        rows.append(
+            {
+                "distance": dist_vals[ch],
+                "phase": p.phase,
+                "onset_sample": smp,
+                "onset_time": time_vals[smp],
+                "score": float(p.confidence),
+                "cft_at_onset": np.nan,
+                "off_sample": np.nan,
+                "off_time": np.nan,
+                "cft_at_off": np.nan,
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=PICK_COLUMNS)
+    if not df.empty:
+        df.sort_values(["distance", "onset_sample"], inplace=True, ignore_index=True)
+    return df
+
+
+def _resolve_seisbench_model(model, pretrained):
+    """Return (base_model, model_key). ``model`` is a registry key string or a
+    pre-built SeisBench model instance. Validates output_type == 'array'."""
+    import seisbench.models as sbm
+
+    if isinstance(model, str):
+        key = model.lower()
+        cls_name = _SEISBENCH_MODELS.get(key)
+        if cls_name is None:
+            raise ValueError(
+                f"unknown SeisBench model {model!r}. Known keys: "
+                f"{sorted(_SEISBENCH_MODELS)}. You may also pass a pre-built "
+                f"SeisBench model instance."
+            )
+        base = getattr(sbm, cls_name).from_pretrained(pretrained)
+    else:
+        base = model
+        key = getattr(base, "name", base.__class__.__name__).lower()
+
+    output_type = getattr(base, "output_type", None)
+    if output_type != "array":
+        raise ValueError(
+            f"model {key!r} has output_type={output_type!r}; the SeisBench DAS "
+            f"wrapper only supports output_type=='array' models (e.g. "
+            f"eqtransformer, phasenet). Point-output models like GPD are not "
+            f"supported."
+        )
+    return base, key
+
+
+def seisbench_picker(
+    patch,
+    model="eqtransformer",
+    pretrained="original",
+    component_strategy="clone",
+    min_prob=0.3,
+    min_time_separation=1.0,
+    device=None,
+    plot=False,
+    plot_channel=None,
+    file_name=None,
+    db_save=True,
+    db_path=None,
+    author=None,
+    **classify_kwargs,
+):
+    """Run any SeisBench phase picker on a DAS patch via the experimental
+    ``DASWaveformModelWrapper``, returning picks in the shared PICK_COLUMNS
+    schema (same as ``trigger_picker`` / ``phasenet_picker``).
+
+    The chosen single-station model is applied **channel by channel**: each DAS
+    channel's single component is expanded to the model's component count
+    (``component_strategy``), the model's per-channel probability curves are
+    peak-picked by SeisBench, and the picks are mapped back to (distance, time).
+    Each channel is treated independently -- this is distinct from, and
+    generally weaker than, the dedicated 2-D PhaseNet-DAS model in
+    ``phasenet_picker``.
+
+    Parameters
+    ----------
+    patch : dascore Patch with "distance" and "time" coords.
+    model : SeisBench model. Either a registry key (one of
+        ``eqtransformer``, ``phasenet``, ``phasenetlight``,
+        ``variablelengthphasenet``, ``obstransformer``, ``skynet``) or a
+        pre-built SeisBench model instance. Must have ``output_type == "array"``.
+    pretrained : pretrained weight set passed to ``<Model>.from_pretrained``
+        when ``model`` is a key, e.g. "original", "stead", "instance". Ignored
+        when ``model`` is already an instance.
+    component_strategy : how to turn the single DAS component into the model's
+        multi-component input. "clone" (replicate to every component) or "pad"
+        (first component is the data, the rest zeros).
+    min_prob : confidence threshold for picking (SeisBench ``thresholds``).
+    min_time_separation : minimum spacing (s) between two same-phase picks on a
+        channel (SeisBench ``min_time_separation``).
+    device : "cuda" / "cpu" / "mps"; auto-detected (cuda if available else cpu).
+    plot, plot_channel : diagnostic plot via the shared ``_plot_picks``.
+    file_name, db_save, db_path : catalog persistence.
+    author : catalog author label. Defaults to ``"<model_key>_sb"`` (e.g.
+        "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix marks every
+        SeisBench-backed result and keeps the ``phasenet`` key from overwriting
+        the 2-D PhaseNet-DAS picks (author "phasenet") from ``phasenet_picker``.
+    **classify_kwargs : forwarded to the wrapper's ``classify`` (e.g.
+        ``overlap_samples``, ``blinding``).
+
+    Returns
+    -------
+    pandas.DataFrame with columns == PICK_COLUMNS. Picks populate ``score``
+    (confidence); cft_* and off_* columns are NaN.
+    """
+    import asyncio
+    from seisbench.models import DASWaveformModelWrapper, DASPickingCallback
+
+    if device is None:
+        device = _auto_device()
+
+    base, model_key = _resolve_seisbench_model(model, pretrained)
+    if author is None:
+        author = f"{model_key}_sb"
+
+    wrapper = DASWaveformModelWrapper(base, component_strategy=component_strategy)
+    wrapper.to(device)
+    wrapper.eval()
+
+    da, dist_vals, time_vals, fs, t0_ns = _patch_to_xdas(patch)
+    n_time = len(time_vals)
+
+    # DASWaveformModelWrapper.classify_callback is abstract and raises
+    # NotImplementedError, so we bypass classify() and drive annotate_async
+    # directly with a DASPickingCallback.
+    callback = DASPickingCallback(
+        thresholds=min_prob,
+        min_time_separation=min_time_separation,
+    )
+    asyncio.run(wrapper.annotate_async(da, callback, **classify_kwargs))
+    results_dict = callback.get_results_dict()
+
+    phase_keys = getattr(wrapper, "annotate_keys", None) or ["P", "S"]
+    picks = []
+    for key in phase_keys:
+        plist = results_dict.get(key)
+        if plist:
+            picks.extend(list(plist))
+
+    df = _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time)
+
+    if plot:
+        n_ch = len(dist_vals)
+        ch_idx = plot_channel if plot_channel is not None else n_ch // 2
+        _plot_picks(patch, df, ch_idx, None, None, None)
+
+    if db_save:
+        _save_to_catalog(df, file_name=file_name, author=author, db_path=db_path)
+
+    return df
+
+
+def eqtransformer_picker(patch, pretrained="original", **kwargs):
+    """EQTransformer P/S picks on a DAS patch. Thin wrapper over
+    :func:`seisbench_picker` with ``model="eqtransformer"`` (catalog author
+    "eqtransformer"). See ``seisbench_picker`` for all keyword arguments."""
+    return seisbench_picker(
+        patch, model="eqtransformer", pretrained=pretrained, **kwargs
+    )

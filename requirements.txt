@@ -1,0 +1,17 @@
+# Core DAS processing / QC
+dascore
+numpy
+pandas
+scipy
+matplotlib
+h5py
+
+# Phase picking
+obspy            # STA/LTA + AR-AIC pickers (dasieve.picker)
+torch            # backend for the deep-learning pickers
+
+# Deep-learning pickers
+#   PhaseNet-DAS runs from the vendored EQNet submodule (dasieve/EQNet);
+#   it is not on PyPI -> initialise it with: git submodule update --init --recursive
+seisbench        # SeisBench pickers on DAS (dasieve.picker.seisbench_picker)
+xdas             # DAS data array required by SeisBench's DASWaveformModelWrapper
