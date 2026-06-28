@@ -85,7 +85,140 @@ df_eqt = sieve.picker.seisbench_picker(
     plot_channel=280,
     file_name=source_file,
 )
+#%%
 
+def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
+    """Compare disk-based phasenet_picker vs in-memory predict on the same patch.
+
+    Plots two waterfall panels (one per method with picks overlaid) and a
+    histogram of matched-pick time differences (in-memory minus disk-based).
+    """
+    import time
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from dasieve.phasenet_memory import predict as mem_predict
+
+    # ── run both pickers ──────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    df_disk = sieve.picker.phasenet_picker(
+        patch, min_prob=min_prob, plot=False, file_name=source_file, db_save=False
+    )
+    t_disk = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    df_mem = mem_predict(patch, min_prob=min_prob)
+    t_mem = time.perf_counter() - t0
+
+    print(f"disk-based : {len(df_disk):5d} picks  {t_disk:.2f}s")
+    print(f"in-memory  : {len(df_mem):5d} picks  {t_mem:.2f}s")
+
+    # ── match picks by (distance, phase) nearest-neighbour in time ────────────
+    time_vals = patch.coords.get_array("time")
+    dt_s = float(np.median(np.diff(time_vals)) / np.timedelta64(1, "s"))
+    max_match_samp = int(max_match_s / dt_s)
+
+    diffs_ms = []
+    for _, row in df_disk.iterrows():
+        sub = df_mem[
+            (df_mem["distance"] == row["distance"]) & (df_mem["phase"] == row["phase"])
+        ]
+        if sub.empty:
+            continue
+        delta = (sub["onset_sample"] - int(row["onset_sample"])).abs()
+        best = delta.idxmin()
+        if delta[best] <= max_match_samp:
+            diffs_ms.append(
+                (sub.loc[best, "onset_sample"] - row["onset_sample"]) * dt_s * 1e3
+            )
+    diffs_ms = np.array(diffs_ms)
+
+    if len(diffs_ms):
+        print(
+            f"matched    : {len(diffs_ms):5d} pairs  "
+            f"mean={np.mean(np.abs(diffs_ms)):.2f} ms  "
+            f"max={np.max(np.abs(diffs_ms)):.2f} ms"
+        )
+    else:
+        print("matched    :     0 pairs")
+
+    # ── build common plot arrays ───────────────────────────────────────────────
+    dist_vals = patch.coords.get_array("distance")
+    t_sec = (time_vals - time_vals[0]) / np.timedelta64(1, "s")
+
+    dist_axis = patch.dims.index("distance")
+    time_axis = patch.dims.index("time")
+    data2d = np.moveaxis(patch.data, [dist_axis, time_axis], [0, 1])  # (nx, nt)
+    vmax = np.percentile(np.abs(data2d), 99)
+    extent = [t_sec[0], t_sec[-1], dist_vals[-1], dist_vals[0]]
+
+    PHASE_COLORS = {"P": "cyan", "S": "lime"}
+
+    def _waterfall(ax, df, title):
+        ax.imshow(
+            data2d,
+            aspect="auto",
+            extent=extent,
+            cmap="RdBu",
+            vmin=-vmax,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        for phase, col in PHASE_COLORS.items():
+            sub = df[df["phase"] == phase]
+            if not sub.empty:
+                ax.scatter(
+                    t_sec[sub["onset_sample"].astype(int)],
+                    sub["distance"],
+                    marker="|",
+                    s=40,
+                    color=col,
+                    linewidths=1.0,
+                    label=phase,
+                    zorder=3,
+                )
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Distance (m)")
+        ax.set_title(title)
+        ax.legend(loc="upper right", fontsize=8)
+
+    _, axes = plt.subplots(
+        1, 3, figsize=(20, 7),
+        gridspec_kw={"width_ratios": [5, 5, 2]},
+    )
+
+    _waterfall(
+        axes[0], df_disk,
+        f"phasenet_picker (disk)\n{len(df_disk)} picks  {t_disk:.1f}s",
+    )
+    _waterfall(
+        axes[1], df_mem,
+        f"phasenet_memory (in-memory)\n{len(df_mem)} picks  {t_mem:.1f}s",
+    )
+
+    ax_h = axes[2]
+    if len(diffs_ms):
+        ax_h.hist(
+            diffs_ms, bins=40, color="steelblue", edgecolor="none",
+            orientation="horizontal",
+        )
+        ax_h.axhline(0, color="k", linewidth=0.8, linestyle="--")
+        ax_h.set_xlabel("Count")
+        ax_h.set_ylabel("Δt  (ms)  [in-memory − disk]")
+        ax_h.set_title(
+            f"{len(diffs_ms)} matched\n"
+            f"μ = {np.mean(diffs_ms):.2f} ms\n"
+            f"σ = {np.std(diffs_ms):.2f} ms"
+        )
+    else:
+        ax_h.text(0.5, 0.5, "no matched picks", ha="center", va="center",
+                  transform=ax_h.transAxes)
+
+    plt.tight_layout()
+    plt.show()
+    return df_disk, df_mem, diffs_ms
+
+
+df_disk, df_mem, diffs_ms = test_phasenet(patch, source_file=source_file)
 
 ########
 
