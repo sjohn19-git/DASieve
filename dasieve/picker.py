@@ -3,6 +3,7 @@ import sys
 import glob as _glob
 import tempfile
 import importlib.util
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -594,6 +595,40 @@ def _patch_to_xdas(patch):
     return da, dist_vals, time_vals, fs, t0_ns
 
 
+def _model_window_seconds(base):
+    """Required input-window length (seconds) of a SeisBench model, or None if
+    the model does not expose a fixed window (e.g. variable-length nets)."""
+    in_samples = getattr(base, "in_samples", None)
+    model_fs = getattr(base, "sampling_rate", None)
+    if not in_samples or not model_fs:
+        return None
+    return in_samples / model_fs
+
+
+def _pad_patch_time(patch, target_samples):
+    """Zero-pad a dascore patch along ``time`` up to ``target_samples`` samples,
+    extending the time coordinate at the native sample spacing. The original
+    data sits at the start; appended samples are zeros. Returns a new patch."""
+    time_vals = patch.coords.get_array("time")
+    nt = len(time_vals)
+    n_pad = int(target_samples) - nt
+    if n_pad <= 0:
+        return patch
+
+    dt = np.median(np.diff(time_vals))
+    extra_time = time_vals[-1] + dt * np.arange(1, n_pad + 1)
+    new_time = np.concatenate([time_vals, extra_time])
+
+    time_axis = patch.dims.index("time")
+    pad_width = [(0, 0)] * patch.data.ndim
+    pad_width[time_axis] = (0, n_pad)
+    new_data = np.pad(patch.data, pad_width, mode="constant", constant_values=0)
+
+    new_coords = {d: patch.coords.get_array(d) for d in patch.dims}
+    new_coords["time"] = new_time
+    return patch.new(data=new_data, coords=new_coords)
+
+
 def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time):
     """Map SeisBench ``DASPick`` objects (time=datetime64, channel=<distance
     coord value>, confidence, phase) into the shared PICK_COLUMNS schema.
@@ -673,6 +708,7 @@ def seisbench_picker(
     component_strategy="clone",
     min_prob=0.3,
     min_time_separation=1.0,
+    pad_short=True,
     device=None,
     plot=False,
     plot_channel=None,
@@ -710,6 +746,13 @@ def seisbench_picker(
     min_prob : confidence threshold for picking (SeisBench ``thresholds``).
     min_time_separation : minimum spacing (s) between two same-phase picks on a
         channel (SeisBench ``min_time_separation``).
+    pad_short : if the patch is shorter than the model's fixed input window
+        (e.g. EQTransformer needs 60 s = 6000 samples @ 100 Hz), zero-pad it in
+        time up to one full window so the model can run. If ``False``, the patch
+        is left as-is and a warning is emitted (SeisBench will return no picks
+        when there is not a single complete window). Picks landing in the padded
+        region are unreliable; prefer feeding a patch that is already long
+        enough.
     device : "cuda" / "cpu" / "mps"; auto-detected (cuda if available else cpu).
     plot, plot_channel : diagnostic plot via the shared ``_plot_picks``.
     file_name, db_save, db_path : catalog persistence.
@@ -739,6 +782,37 @@ def seisbench_picker(
     wrapper.to(device)
     wrapper.eval()
 
+    # The single-station model has a fixed input window (in_samples @
+    # sampling_rate). SeisBench resamples each channel to the model's rate, then
+    # slides that window across the trace; if the patch is shorter than one full
+    # window there is nothing to run and annotate returns no picks. Warn, and
+    # optionally zero-pad up to a single window so the model can produce output.
+    window_s = _model_window_seconds(base)
+    if window_s is not None:
+        t_vals = patch.coords.get_array("time")
+        nt = len(t_vals)
+        patch_fs = 1.0 / (np.median(np.diff(t_vals)) / np.timedelta64(1, "s"))
+        patch_s = nt / patch_fs
+        if patch_s < window_s:
+            # samples needed at the patch's own rate to cover one model window
+            need_samples = int(np.ceil(window_s * patch_fs))
+            if pad_short:
+                warnings.warn(
+                    f"{model_key}: patch is {patch_s:.2f}s but the model needs a "
+                    f"{window_s:.2f}s window; zero-padding to {window_s:.2f}s. "
+                    f"Picks in the padded region are unreliable.",
+                    stacklevel=2,
+                )
+                patch = _pad_patch_time(patch, need_samples)
+            else:
+                warnings.warn(
+                    f"{model_key}: patch is {patch_s:.2f}s, shorter than the "
+                    f"model's {window_s:.2f}s window; no complete window exists "
+                    f"so no picks will be returned. Pass a longer patch or "
+                    f"pad_short=True.",
+                    stacklevel=2,
+                )
+
     da, dist_vals, time_vals, fs, t0_ns = _patch_to_xdas(patch)
     n_time = len(time_vals)
 
@@ -749,10 +823,23 @@ def seisbench_picker(
         thresholds=min_prob,
         min_time_separation=min_time_separation,
     )
-    asyncio.run(wrapper.annotate_async(da, callback, **classify_kwargs))
+    try:
+        asyncio.get_running_loop()
+        # Inside Jupyter / FastAPI / any running event loop — asyncio.run()
+        # would fail because it tries to create a new loop in the same thread.
+        # Run the coroutine in a fresh worker thread that owns its own loop.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, wrapper.annotate_async(da, callback, **classify_kwargs)).result()
+    except RuntimeError:
+        # No running loop — the normal script path.
+        asyncio.run(wrapper.annotate_async(da, callback, **classify_kwargs))
     results_dict = callback.get_results_dict()
 
-    phase_keys = getattr(wrapper, "annotate_keys", None) or ["P", "S"]
+    all_keys = getattr(wrapper, "annotate_keys", None) or ["P", "S"]
+    # "Detection" is EQTransformer's event-presence head, not a phase arrival;
+    # exclude it so only phase picks reach the shared schema.
+    phase_keys = [k for k in all_keys if k.lower() != "detection"]
     picks = []
     for key in phase_keys:
         plist = results_dict.get(key)

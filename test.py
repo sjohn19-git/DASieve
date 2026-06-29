@@ -27,7 +27,7 @@ h5_files = [
 source_file = h5_files[0]
 
 patch = dc.spool(source_file)[0]
-patch = patch.select(distance=(0, 3000))
+patch = patch.select(distance=(1000, 3000))
 patch = sieve.processing.to_strain_rate(patch)
 patch = sieve.processing.cmd_remove(
     patch, dim="distance", window=5000, method="median", plot=True
@@ -82,9 +82,11 @@ df_eqt = sieve.picker.seisbench_picker(
     pretrained="original",
     min_prob=0.3,
     plot=True,
-    plot_channel=280,
     file_name=source_file,
+    pad_short=True
 )
+
+
 #%%
 
 def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
@@ -223,7 +225,7 @@ df_disk, df_mem, diffs_ms = test_phasenet(patch, source_file=source_file)
 ########
 
 
-
+#%%
 
 
 import matplotlib
