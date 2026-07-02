@@ -24,20 +24,32 @@ logging.basicConfig(
 h5_files = [
     "/Users/sj201/Downloads/16BConst_Stimulation_UTC_20240407_072054.163.h5"
 ]
+
 source_file = h5_files[0]
+survey_path = "/Users/sj201/Downloads/survey.csv"
 
 patch = dc.spool(source_file)[0]
+survey = sieve.processing.load_survey(survey_path)
+dist = patch.coords.get_array("x")
+
+patch = sieve.processing.attach_geometry(patch, survey)
+
+
+
 patch = patch.select(distance=(1000, 3000))
 patch = sieve.processing.to_strain_rate(patch)
 patch = sieve.processing.cmd_remove(
     patch, dim="distance", window=5000, method="median", plot=True
 )
+
 patch = sieve.processing.decimate(
     patch, target_fs=500, target_dx=5, plot=True, lateral_stacking=True, pws_power=0
 )
+
+
+#%%
+
 freqs, psd_db = sieve.qc.compute_psd(patch, plot=True, vmax=0.8, ylim=(-160, -132.5))
-
-
 
 
 df_trig = sieve.picker.trigger_picker(
@@ -70,7 +82,7 @@ df_trig = sieve.picker.trigger_picker(
 #     file_name=source_file,
 # )
 
-df_pn = sieve.picker.phasenet_picker(
+df_pn = sieve.picker.phasenet_das_picker(
     patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
 )
 
@@ -87,10 +99,19 @@ df_eqt = sieve.picker.seisbench_picker(
 )
 
 
+# string key — loads pretrained weights automatically
+df = sieve.picker.seisbench_picker(
+    patch,
+    model="phasenet",
+    pretrained="original",
+    plot=True,
+    file_name=source_file)
+
+
 #%%
 
 def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
-    """Compare disk-based phasenet_picker vs in-memory predict on the same patch.
+    """Compare in-memory phasenet_das_picker vs disk-based phasenet_das_picker_disk.
 
     Plots two waterfall panels (one per method with picks overlaid) and a
     histogram of matched-pick time differences (in-memory minus disk-based).
@@ -98,21 +119,22 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
     import time
     import numpy as np
     import matplotlib.pyplot as plt
-    from dasieve.phasenet_memory import predict as mem_predict
 
     # ── run both pickers ──────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    df_disk = sieve.picker.phasenet_picker(
+    df_mem = sieve.picker.phasenet_das_picker(
+        patch, min_prob=min_prob, plot=False, file_name=source_file, db_save=False
+    )
+    t_mem = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    df_disk = sieve.picker.phasenet_das_picker_disk(
         patch, min_prob=min_prob, plot=False, file_name=source_file, db_save=False
     )
     t_disk = time.perf_counter() - t0
 
-    t0 = time.perf_counter()
-    df_mem = mem_predict(patch, min_prob=min_prob)
-    t_mem = time.perf_counter() - t0
-
-    print(f"disk-based : {len(df_disk):5d} picks  {t_disk:.2f}s")
     print(f"in-memory  : {len(df_mem):5d} picks  {t_mem:.2f}s")
+    print(f"disk-based : {len(df_disk):5d} picks  {t_disk:.2f}s")
 
     # ── match picks by (distance, phase) nearest-neighbour in time ────────────
     time_vals = patch.coords.get_array("time")
@@ -189,12 +211,12 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
     )
 
     _waterfall(
-        axes[0], df_disk,
-        f"phasenet_picker (disk)\n{len(df_disk)} picks  {t_disk:.1f}s",
+        axes[0], df_mem,
+        f"phasenet_das_picker (in-memory)\n{len(df_mem)} picks  {t_mem:.1f}s",
     )
     _waterfall(
-        axes[1], df_mem,
-        f"phasenet_memory (in-memory)\n{len(df_mem)} picks  {t_mem:.1f}s",
+        axes[1], df_disk,
+        f"phasenet_das_picker_disk\n{len(df_disk)} picks  {t_disk:.1f}s",
     )
 
     ax_h = axes[2]
@@ -217,10 +239,10 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
 
     plt.tight_layout()
     plt.show()
-    return df_disk, df_mem, diffs_ms
+    return df_mem, df_disk, diffs_ms
 
 
-df_disk, df_mem, diffs_ms = test_phasenet(patch, source_file=source_file)
+df_mem, df_disk, diffs_ms = test_phasenet(patch, source_file=source_file)
 
 ########
 
@@ -240,6 +262,7 @@ os.makedirs(results_dir, exist_ok=True)
 batch_files = sorted(glob.glob(os.path.join(h5_loc, "**", "*.h5"), recursive=True))[
     :100
 ]
+survey = sieve.processing.load_survey(survey_path)
 if not batch_files:
     logging.warning("No .h5 files found in %s", h5_loc)
 else:
@@ -249,6 +272,7 @@ else:
         logging.info("Processing %s", stem)
         try:
             patch = dc.spool(source_file)[0]
+            patch = sieve.processing.attach_geometry(patch, survey)
             patch = patch.select(distance=(0, 3000))
             patch = sieve.processing.to_strain_rate(patch)
             patch = sieve.processing.decimate(
@@ -263,7 +287,7 @@ else:
                 patch, dim="distance", window=5000, method="median"
             )
 
-            df_pn = sieve.picker.phasenet_picker(
+            df_pn = sieve.picker.phasenet_das_picker(
                 patch, min_prob=0.3, plot=True, plot_channel=None, file_name=source_file
             )
 

@@ -4,6 +4,7 @@ import glob as _glob
 import tempfile
 import importlib.util
 import warnings
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -319,6 +320,94 @@ def trigger_picker(
 # ---------------------------------------------------------------------------
 DEFAULT_EQNET_DIR = os.path.join(os.path.dirname(__file__), "EQNet")
 
+_MODEL_CACHE: dict = {}
+
+
+def _ensure_eqnet_on_path(eqnet_dir):
+    eqnet_dir = os.path.abspath(eqnet_dir)
+    if eqnet_dir not in sys.path:
+        sys.path.insert(0, eqnet_dir)
+    return eqnet_dir
+
+
+def _load_model(eqnet_dir, device, location, phases):
+    import torch
+    import eqnet
+
+    cache_key = (eqnet_dir, device, location, tuple(phases))
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
+
+    model = eqnet.models.__dict__["phasenet_das"].build_model(
+        backbone="unet",
+        in_channels=1,
+        out_channels=len(phases) + 1,
+    )
+
+    if location is None:
+        model_url = (
+            "https://github.com/AI4EPS/models/releases/download/"
+            "PhaseNet-DAS-v1/PhaseNet-DAS-v1.pth"
+        )
+    elif location == "forge":
+        model_url = (
+            "https://github.com/AI4EPS/models/releases/download/"
+            "PhaseNet-DAS-ConvertedPhase/model_99.pth"
+        )
+    else:
+        raise ValueError(f"no pretrained model for location={location!r}")
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(eqnet_dir)
+        checkpoint = torch.hub.load_state_dict_from_url(
+            model_url,
+            model_dir="./model_phasenet_das",
+            progress=True,
+            check_hash=True,
+            map_location="cpu",
+        )
+    finally:
+        os.chdir(cwd)
+
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.to(device)
+    model.eval()
+
+    _MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _preprocess(patch, highpass_filter=0.0):
+    import torch
+    import scipy.signal
+    from eqnet.data.das import padding
+
+    dist_vals = patch.coords.get_array("distance")
+    time_vals = patch.coords.get_array("time")
+
+    dist_axis = patch.dims.index("distance")
+    time_axis = patch.dims.index("time")
+    data = np.moveaxis(patch.data, [dist_axis, time_axis], [0, 1])  # (nx, nt)
+    data = np.ascontiguousarray(data, dtype=np.float32)
+
+    dt_s = float(np.median(np.diff(time_vals)) / np.timedelta64(1, "s"))
+    begin_time = pd.Timestamp(time_vals[0]).to_pydatetime().isoformat(timespec="milliseconds")
+
+    data = data - np.mean(data, axis=-1, keepdims=True)
+    data = data - np.median(data, axis=-2, keepdims=True)
+    if highpass_filter > 0.0:
+        b, a = scipy.signal.butter(2, highpass_filter, "hp", fs=1.0 / dt_s)
+        data = scipy.signal.filtfilt(b, a, data, axis=-1)
+
+    data = data.T[np.newaxis, :, :]  # (1, nt, nx)
+    tensor = torch.from_numpy(data)
+
+    nt, nx = tensor.shape[1], tensor.shape[2]
+    tensor = padding(tensor, min_nt=1024, min_nx=1024)
+
+    return tensor, nt, nx, dt_s, begin_time, dist_vals, time_vals
+
 
 def _import_eqnet_predict(eqnet_dir):
     """Import EQNet's predict.py as a module *in-process* (no os.system).
@@ -366,7 +455,101 @@ def _patch_to_eqnet_h5(patch, h5_path):
     return dist_vals, time_vals
 
 
-def phasenet_picker(
+def phasenet_das_picker(
+    patch,
+    eqnet_dir=DEFAULT_EQNET_DIR,
+    min_prob=0.3,
+    device=None,
+    phases=("P", "S"),
+    highpass_filter=0.0,
+    location=None,
+    plot=False,
+    plot_channel=None,
+    file_name=None,
+    db_save=True,
+    db_path=None,
+):
+    """PhaseNet-DAS picks on a DAS patch, entirely in memory (no temp files).
+
+    The model is loaded once per process and cached; subsequent calls reuse
+    the cached weights.
+
+    Parameters
+    ----------
+    patch : dascore Patch with "distance" and "time" coords.
+    eqnet_dir : path to the EQNet repo directory.
+    min_prob : minimum phase probability threshold.
+    device : "cuda" / "mps" / "cpu"; auto-detected if None.
+    phases : phase labels the model outputs, default ("P", "S").
+    highpass_filter : highpass corner in Hz; 0.0 = no filter.
+    location : pretrained model variant; None for default, "forge" for FORGE.
+
+    Returns
+    -------
+    pandas.DataFrame with columns == PICK_COLUMNS.
+    """
+    import torch
+
+    phases = list(phases)
+    eqnet_dir = _ensure_eqnet_on_path(eqnet_dir)
+
+    if device is None:
+        device = _auto_device()
+
+    model = _load_model(eqnet_dir, device, location, phases)
+
+    data, nt, nx, dt_s, begin_time, dist_vals, time_vals = _preprocess(
+        patch, highpass_filter
+    )
+
+    data_batched = data.unsqueeze(0).to(device)
+
+    dtype_str = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
+    ptdtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_str]
+    ctx = nullcontext() if device == "cpu" else torch.amp.autocast(device_type=device, dtype=ptdtype)
+
+    with torch.inference_mode(), ctx:
+        output = model({"data": data_batched})
+
+    phase_out = output["phase"][:, :, :nt, :nx].cpu()
+    scores = torch.softmax(phase_out, dim=1)
+
+    from eqnet.utils import detect_peaks, extract_picks
+
+    topk_scores, topk_inds = detect_peaks(scores, vmin=min_prob, kernel=21)
+
+    picks_ = extract_picks(
+        topk_inds,
+        topk_scores,
+        file_name=["in_memory"],
+        begin_time=[begin_time],
+        begin_time_index=torch.tensor([0]),
+        begin_channel_index=torch.tensor([0]),
+        dt=dt_s,
+        vmin=min_prob,
+        phases=phases,
+    )
+
+    frames = []
+    if picks_[0]:
+        df_raw = pd.DataFrame(picks_[0])
+        df_raw["channel_index"] = df_raw["station_id"].apply(lambda x: int(x))
+        frames.append(df_raw)
+
+    df = _phasenet_picks_to_df(frames, dist_vals, time_vals, len(time_vals))
+
+    if plot:
+        n_ch = len(dist_vals)
+        ch_idx = plot_channel if plot_channel is not None else n_ch // 2
+        _plot_picks(patch, df, ch_idx, None, None, None)
+
+    if db_save:
+        _save_to_catalog(df, file_name=file_name, author="phasenet", db_path=db_path)
+
+    return df
+
+
+def phasenet_das_picker_disk(
     patch,
     eqnet_dir=DEFAULT_EQNET_DIR,
     min_prob=0.3,
@@ -383,15 +566,12 @@ def phasenet_picker(
     db_save=True,
     db_path=None,
 ):
-    """PhaseNet-DAS picks on a DAS patch, returned in the shared PICK_COLUMNS
-    schema (same as ``trigger_picker``).
+    """PhaseNet-DAS picks via EQNet's disk-based pipeline (temp h5 + CSV).
 
-    Unlike the per-trace ``sta_lta`` / ``ar`` methods, PhaseNet-DAS runs once
-    on the whole (channel x time) patch. EQNet's prediction pipeline is invoked
-    by **importing** predict.py and calling ``predict.main`` in-process (no
-    ``os.system``); the patch is staged as a temporary h5 file in the format
-    EQNet's ``DASIterableDataset`` expects, and the resulting picks CSV is read
-    back and mapped into the shared schema.
+    Stages the patch as a temporary h5 file, runs EQNet's predict.main
+    in-process, reads back the CSV picks. Prefer ``phasenet_das_picker``
+    (in-memory) for normal use; this variant is kept for comparison and
+    cut_patch tiling support.
 
     Parameters
     ----------
@@ -545,10 +725,10 @@ def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time):
 #     their relatives; point-output models like GPD are NOT supported.
 #   * Each channel is treated independently (no spatial coherence). This is a
 #     *different, generally weaker* approach than the dedicated 2-D PhaseNet-DAS
-#     model in EQNet (see ``phasenet_picker``); it does not replace it.
+#     model in EQNet (see ``phasenet_das_picker``); it does not replace it.
 #
 # Requires the optional dependencies ``seisbench`` and ``xdas`` (imported
-# lazily, like ``torch`` in ``phasenet_picker``).
+# lazily, like ``torch`` in ``phasenet_das_picker``).
 
 # Friendly name -> SeisBench class name. ``model=`` may also be a pre-built
 # SeisBench model instance, bypassing this table.
@@ -672,8 +852,10 @@ def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time):
 
 
 def _resolve_seisbench_model(model, pretrained):
-    """Return (base_model, model_key). ``model`` is a registry key string or a
-    pre-built SeisBench model instance. Validates output_type == 'array'."""
+    """Return (base_model, model_key).
+
+    ``model`` may be a registry key string or a pre-built SeisBench instance.
+    """
     import seisbench.models as sbm
 
     if isinstance(model, str):
@@ -720,7 +902,7 @@ def seisbench_picker(
 ):
     """Run any SeisBench phase picker on a DAS patch via the experimental
     ``DASWaveformModelWrapper``, returning picks in the shared PICK_COLUMNS
-    schema (same as ``trigger_picker`` / ``phasenet_picker``).
+    schema (same as ``trigger_picker`` / ``phasenet_das_picker``).
 
     The chosen single-station model is applied **channel by channel**: each DAS
     channel's single component is expanded to the model's component count
@@ -728,7 +910,7 @@ def seisbench_picker(
     peak-picked by SeisBench, and the picks are mapped back to (distance, time).
     Each channel is treated independently -- this is distinct from, and
     generally weaker than, the dedicated 2-D PhaseNet-DAS model in
-    ``phasenet_picker``.
+    ``phasenet_das_picker``.
 
     Parameters
     ----------
@@ -759,7 +941,7 @@ def seisbench_picker(
     author : catalog author label. Defaults to ``"<model_key>_sb"`` (e.g.
         "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix marks every
         SeisBench-backed result and keeps the ``phasenet`` key from overwriting
-        the 2-D PhaseNet-DAS picks (author "phasenet") from ``phasenet_picker``.
+        the 2-D PhaseNet-DAS picks (author "phasenet") from ``phasenet_das_picker``.
     **classify_kwargs : forwarded to the wrapper's ``classify`` (e.g.
         ``overlap_samples``, ``blinding``).
 
@@ -778,15 +960,10 @@ def seisbench_picker(
     if author is None:
         author = f"{model_key}_sb"
 
-    wrapper = DASWaveformModelWrapper(base, component_strategy=component_strategy)
-    wrapper.to(device)
-    wrapper.eval()
+    runner = DASWaveformModelWrapper(base, component_strategy=component_strategy)
+    runner.to(device)
+    runner.eval()
 
-    # The single-station model has a fixed input window (in_samples @
-    # sampling_rate). SeisBench resamples each channel to the model's rate, then
-    # slides that window across the trace; if the patch is shorter than one full
-    # window there is nothing to run and annotate returns no picks. Warn, and
-    # optionally zero-pad up to a single window so the model can produce output.
     window_s = _model_window_seconds(base)
     if window_s is not None:
         t_vals = patch.coords.get_array("time")
@@ -794,7 +971,6 @@ def seisbench_picker(
         patch_fs = 1.0 / (np.median(np.diff(t_vals)) / np.timedelta64(1, "s"))
         patch_s = nt / patch_fs
         if patch_s < window_s:
-            # samples needed at the patch's own rate to cover one model window
             need_samples = int(np.ceil(window_s * patch_fs))
             if pad_short:
                 warnings.warn(
@@ -811,32 +987,25 @@ def seisbench_picker(
                     f"so no picks will be returned. Pass a longer patch or "
                     f"pad_short=True.",
                     stacklevel=2,
-                )
+                    )
 
     da, dist_vals, time_vals, fs, t0_ns = _patch_to_xdas(patch)
     n_time = len(time_vals)
 
-    # DASWaveformModelWrapper.classify_callback is abstract and raises
-    # NotImplementedError, so we bypass classify() and drive annotate_async
-    # directly with a DASPickingCallback.
     callback = DASPickingCallback(
         thresholds=min_prob,
         min_time_separation=min_time_separation,
     )
     try:
         asyncio.get_running_loop()
-        # Inside Jupyter / FastAPI / any running event loop — asyncio.run()
-        # would fail because it tries to create a new loop in the same thread.
-        # Run the coroutine in a fresh worker thread that owns its own loop.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(asyncio.run, wrapper.annotate_async(da, callback, **classify_kwargs)).result()
+            pool.submit(asyncio.run, runner.annotate_async(da, callback, **classify_kwargs)).result()
     except RuntimeError:
-        # No running loop — the normal script path.
-        asyncio.run(wrapper.annotate_async(da, callback, **classify_kwargs))
+        asyncio.run(runner.annotate_async(da, callback, **classify_kwargs))
     results_dict = callback.get_results_dict()
 
-    all_keys = getattr(wrapper, "annotate_keys", None) or ["P", "S"]
+    all_keys = getattr(runner, "annotate_keys", None) or ["P", "S"]
     # "Detection" is EQTransformer's event-presence head, not a phase arrival;
     # exclude it so only phase picks reach the shared schema.
     phase_keys = [k for k in all_keys if k.lower() != "detection"]
