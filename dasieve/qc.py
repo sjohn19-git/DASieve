@@ -33,7 +33,7 @@ import dascore as dc
 log = logging.getLogger(__name__)
 
 
-# Default PSD store location — same directory as the picks catalog
+# Default PSD store location — same directory as the picks store (dasieve.sqlite)
 # (~/DASieve). Single source of truth; callers override only when needed.
 DEFAULT_PSD_STORE = os.path.join(os.path.expanduser("~/DASieve"), "psd_qc.pkl")
 

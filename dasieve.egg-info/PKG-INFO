@@ -15,6 +15,7 @@ Requires-Dist: obspy
 Requires-Dist: torch
 Requires-Dist: seisbench
 Requires-Dist: xdas
+Requires-Dist: gmma @ git+https://github.com/wayneweiqiang/GaMMA.git
 
 # DASieve
 

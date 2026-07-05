@@ -110,7 +110,13 @@ def cmd_remove(
         fs = float(get_dim_sampling_rate(patch, dim))
         block_size = max(1, round(window * fs))
 
-    data = patch.data.copy()
+    # raw h5 data may be integer counts; the subtracted common mode is float,
+    # so work in float regardless of call order relative to to_strain_rate
+    if np.issubdtype(patch.data.dtype, np.floating):
+        data = patch.data.copy()
+    else:
+        data = patch.data.astype(np.float32)
+
     for start in range(0, n, block_size):
         end = min(start + block_size, n)
         idx = [slice(None), slice(None)]
@@ -216,6 +222,52 @@ def decimate(
     return result
 
 
+def _non_dim_coords(patch: dc.Patch) -> dict:
+    """Return {name: dims_tuple} for every coord that is not itself a dim
+    (e.g. x/y/z from attach_geometry, or any metadata coord from the file)."""
+    dim_map = getattr(patch.coords, "dim_map", None)
+    if dim_map is None:  # very old dascore fallback: known geometry names only
+        return {n: ("distance",) for n in ("x", "y", "z")
+                if n in getattr(patch.coords, "coord_map", {})}
+    return {n: tuple(d) for n, d in dim_map.items() if n not in patch.dims}
+
+
+def _grouped_distance_coords(patch: dc.Patch, n_trim: int, n_groups: int, factor: int) -> dict:
+    """Propagate every non-dim coord through lateral stacking so no metadata
+    from the source file (or attach_geometry) is dropped.
+
+    Coords attached to ``distance`` are reduced per channel group: numeric
+    coords are nanmean-averaged (all-NaN groups stay NaN); non-numeric coords
+    take the first value of each group. Coords attached to ``time`` pass
+    through unchanged. Anything else (multi-dim coords) cannot be reduced
+    meaningfully and is skipped with a warning."""
+    import warnings
+
+    out = {}
+    for name, dims in _non_dim_coords(patch).items():
+        arr = np.asarray(patch.coords.get_array(name))
+        if dims == ("distance",):
+            if np.issubdtype(arr.dtype, np.number):
+                with warnings.catch_warnings():
+                    # all-NaN groups (channels absent from the survey) stay NaN
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    grouped = np.nanmean(
+                        arr[:n_trim].astype(float).reshape(n_groups, factor), axis=1
+                    )
+            else:
+                grouped = arr[:n_trim:factor]  # first value of each group
+            out[name] = ("distance", grouped)
+        elif dims == ("time",):
+            out[name] = ("time", arr)
+        else:
+            warnings.warn(
+                f"coord {name!r} (dims={dims}) cannot be carried through "
+                f"lateral stacking and was dropped.",
+                stacklevel=2,
+            )
+    return out
+
+
 def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.Patch:
     """Phase-weighted stack groups of *factor* channels, returning a spatially decimated patch."""
     dist = patch.coords.get_array("distance")
@@ -225,6 +277,7 @@ def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.P
     dist_axis = patch.dims.index("distance")
 
     new_dist = dist[:n_trim].reshape(n_groups, factor).mean(axis=1)
+    geom_coords = _grouped_distance_coords(patch, n_trim, n_groups, factor)
     cols = []
 
     for i in range(n_groups):
@@ -244,7 +297,12 @@ def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.P
     stacked = np.stack(cols, axis=dist_axis)
     return patch.new(
         data=stacked,
-        coords={"distance": new_dist, "time": patch.coords.get_array("time")},
+        coords={
+            "distance": new_dist,
+            "time": patch.coords.get_array("time"),
+            **geom_coords,  # keep x/y/z geometry (group-averaged)
+        },
+        dims=patch.dims,
     )
 
 

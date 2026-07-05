@@ -16,6 +16,9 @@ from dascore.utils.io import patch_to_obspy
 # that don't produce a given field leave it as NaN.
 PICK_COLUMNS = [
     "distance",
+    "x",
+    "y",
+    "z",
     "phase",
     "onset_sample",
     "onset_time",
@@ -25,6 +28,25 @@ PICK_COLUMNS = [
     "off_time",
     "cft_at_off",
 ]
+
+
+def _geom_arrays(patch):
+    """Return (x, y, z) 1-D arrays aligned to the patch's ``distance`` dim.
+
+    Geometry coords are attached by :func:`dasieve.processing.attach_geometry`;
+    a coord that is missing (or the wrong length) yields a NaN-filled array so
+    pickers work unchanged on patches without geometry."""
+    n = len(patch.coords.get_array("distance"))
+    out = {}
+    for name in ("x", "y", "z"):
+        try:
+            arr = np.asarray(patch.coords.get_array(name), dtype=float)
+            if arr.shape[0] != n:
+                arr = np.full(n, np.nan)
+        except Exception:
+            arr = np.full(n, np.nan)
+        out[name] = arr
+    return out["x"], out["y"], out["z"]
 
 
 def _auto_device():
@@ -40,18 +62,19 @@ def _auto_device():
     return "cpu"
 
 
-def _save_to_catalog(df, file_name, author, db_path=None):
-    """Persist picks to the SQLite catalog. Imported lazily to avoid a
-    circular import (dasieve.catalog imports PICK_COLUMNS from this module)."""
+def _save_to_store(df, file_name, method, db_path=None):
+    """Persist picks via :func:`dasieve.store.save_picks`. Imported lazily to
+    avoid a circular import (dasieve.store imports PICK_COLUMNS from this
+    module). Replaces existing rows for (file_name, method)."""
     if file_name is None:
         raise ValueError(
             "db_save=True requires file_name (the source data file). "
             "Pass file_name=... or db_save=False."
         )
-    from .catalog import save_picks
+    from .store import save_picks
 
     kwargs = {} if db_path is None else {"db_path": db_path}
-    return save_picks(df, file_name=file_name, author=author, **kwargs)
+    return save_picks(df, file_name=file_name, method=method, **kwargs)
 
 
 def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
@@ -247,14 +270,16 @@ def trigger_picker(
              "ar" (AR-AIC P/S picker; single-component data is passed for all
              three ar_pick components).
 
-    db_save : if True (default), the picks are persisted to the SQLite catalog
-        via :func:`dasieve.catalog.save_picks`. Requires ``file_name``. The
-        catalog ``author`` is the picking ``method`` (e.g. "sta_lta" or "ar").
-        ``db_path`` overrides the default catalog location.
+    db_save : if True (default), the picks are saved to the store via
+        ``store.save_picks`` with this ``method`` as the store method,
+        replacing previous rows for (file_name, method). ``db_path`` overrides
+        the default store location. Pass db_save=False to only return the
+        DataFrame.
     """
     stream = patch_to_obspy(patch)
     dist_vals = patch.coords.get_array("distance")
     time_vals = patch.coords.get_array("time")
+    x_arr, y_arr, z_arr = _geom_arrays(patch)
 
     n_traces = len(stream)
     ch_idx = plot_channel if plot_channel is not None else n_traces // 2
@@ -290,6 +315,9 @@ def trigger_picker(
             rows.append(
                 {
                     "distance": dist_vals[i],
+                    "x": x_arr[i],
+                    "y": y_arr[i],
+                    "z": z_arr[i],
                     "phase": p["phase"],
                     "onset_sample": on,
                     "onset_time": time_vals[on],
@@ -310,7 +338,7 @@ def trigger_picker(
         _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off)
 
     if db_save:
-        _save_to_catalog(df, file_name=file_name, author=method, db_path=db_path)
+        _save_to_store(df, file_name, method, db_path=db_path)
 
     return df
 
@@ -486,7 +514,9 @@ def phasenet_das_picker(
 
     Returns
     -------
-    pandas.DataFrame with columns == PICK_COLUMNS.
+    pandas.DataFrame with columns == PICK_COLUMNS. When ``db_save`` is True
+    (default) the picks are also saved to the store with method
+    ``"phasenetdas"``, replacing previous rows for (file_name, method).
     """
     import torch
 
@@ -536,7 +566,10 @@ def phasenet_das_picker(
         df_raw["channel_index"] = df_raw["station_id"].apply(lambda x: int(x))
         frames.append(df_raw)
 
-    df = _phasenet_picks_to_df(frames, dist_vals, time_vals, len(time_vals))
+    x_arr, y_arr, z_arr = _geom_arrays(patch)
+    df = _phasenet_picks_to_df(
+        frames, dist_vals, time_vals, len(time_vals), x_arr, y_arr, z_arr
+    )
 
     if plot:
         n_ch = len(dist_vals)
@@ -544,7 +577,7 @@ def phasenet_das_picker(
         _plot_picks(patch, df, ch_idx, None, None, None)
 
     if db_save:
-        _save_to_catalog(df, file_name=file_name, author="phasenet", db_path=db_path)
+        _save_to_store(df, file_name, "phasenetdas", db_path=db_path)
 
     return df
 
@@ -591,7 +624,10 @@ def phasenet_das_picker_disk(
     Returns
     -------
     pandas.DataFrame with columns == PICK_COLUMNS. PhaseNet picks populate
-    ``score`` (phase probability); cft_* and off_* columns are NaN.
+    ``score`` (phase probability); cft_* and off_* columns are NaN. When
+    ``db_save`` is True (default) the picks are also saved to the store with
+    method ``"phasenetdas"``, replacing previous rows for
+    (file_name, method).
     """
     import torch
     import matplotlib
@@ -656,7 +692,10 @@ def phasenet_das_picker_disk(
         except pd.errors.EmptyDataError:
             continue
 
-    df = _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time)
+    x_arr, y_arr, z_arr = _geom_arrays(patch)
+    df = _phasenet_picks_to_df(
+        frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_arr
+    )
 
     if not keep_files and owns_dir:
         import shutil
@@ -669,14 +708,16 @@ def phasenet_das_picker_disk(
         _plot_picks(patch, df, ch_idx, None, None, None)
 
     if db_save:
-        _save_to_catalog(df, file_name=file_name, author="phasenet", db_path=db_path)
+        _save_to_store(df, file_name, "phasenetdas", db_path=db_path)
 
     return df
 
 
-def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time):
+def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_arr):
     """Map EQNet PhaseNet-DAS pick rows (channel_index, phase_index,
-    phase_score, phase_type) into the shared PICK_COLUMNS schema."""
+    phase_score, phase_type) into the shared PICK_COLUMNS schema.
+    ``x_arr/y_arr/z_arr`` are the per-channel geometry arrays from
+    :func:`_geom_arrays`, indexed by channel."""
     if not frames:
         return pd.DataFrame(columns=PICK_COLUMNS)
 
@@ -693,6 +734,9 @@ def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time):
         rows.append(
             {
                 "distance": dist_vals[ch],
+                "x": x_arr[ch],
+                "y": y_arr[ch],
+                "z": z_arr[ch],
                 "phase": r["phase_type"],
                 "onset_sample": smp,
                 "onset_time": time_vals[smp],
@@ -806,12 +850,37 @@ def _pad_patch_time(patch, target_samples):
 
     new_coords = {d: patch.coords.get_array(d) for d in patch.dims}
     new_coords["time"] = new_time
-    return patch.new(data=new_data, coords=new_coords)
+
+    # propagate non-dim coords (x/y/z geometry, any file metadata) so padding
+    # drops nothing: distance-attached pass through, time-attached numeric
+    # coords are NaN-padded to the new length
+    dim_map = getattr(patch.coords, "dim_map", {})
+    for name, dims in dim_map.items():
+        if name in patch.dims:
+            continue
+        arr = np.asarray(patch.coords.get_array(name))
+        dims = tuple(dims)
+        if dims == ("distance",):
+            new_coords[name] = ("distance", arr)
+        elif dims == ("time",) and np.issubdtype(arr.dtype, np.number):
+            new_coords[name] = (
+                "time",
+                np.concatenate([arr.astype(float), np.full(n_pad, np.nan)]),
+            )
+        else:
+            warnings.warn(
+                f"coord {name!r} (dims={dims}) cannot be carried through "
+                f"time padding and was dropped.",
+                stacklevel=2,
+            )
+    return patch.new(data=new_data, coords=new_coords, dims=patch.dims)
 
 
-def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time):
+def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr):
     """Map SeisBench ``DASPick`` objects (time=datetime64, channel=<distance
     coord value>, confidence, phase) into the shared PICK_COLUMNS schema.
+    ``x_arr/y_arr/z_arr`` are the per-channel geometry arrays from
+    :func:`_geom_arrays`, indexed by channel.
 
     ``channel`` is snapped to the nearest distance value and the pick time to
     the nearest sample index so the result drops into PICK_COLUMNS and the
@@ -834,6 +903,9 @@ def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time):
         rows.append(
             {
                 "distance": dist_vals[ch],
+                "x": x_arr[ch],
+                "y": y_arr[ch],
+                "z": z_arr[ch],
                 "phase": p.phase,
                 "onset_sample": smp,
                 "onset_time": time_vals[smp],
@@ -897,7 +969,7 @@ def seisbench_picker(
     file_name=None,
     db_save=True,
     db_path=None,
-    author=None,
+    method=None,
     **classify_kwargs,
 ):
     """Run any SeisBench phase picker on a DAS patch via the experimental
@@ -937,11 +1009,12 @@ def seisbench_picker(
         enough.
     device : "cuda" / "cpu" / "mps"; auto-detected (cuda if available else cpu).
     plot, plot_channel : diagnostic plot via the shared ``_plot_picks``.
-    file_name, db_save, db_path : catalog persistence.
-    author : catalog author label. Defaults to ``"<model_key>_sb"`` (e.g.
-        "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix marks every
-        SeisBench-backed result and keeps the ``phasenet`` key from overwriting
-        the 2-D PhaseNet-DAS picks (author "phasenet") from ``phasenet_das_picker``.
+    file_name, db_save, db_path : store persistence. When ``db_save`` is
+        True (default) the picks are saved, replacing previous rows for
+        (file_name, method).
+    method : store method label. Defaults to ``"<model_key>_sb"`` (e.g.
+        "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix keeps SeisBench
+        results separate from the 2-D PhaseNet-DAS picks ("phasenetdas").
     **classify_kwargs : forwarded to the wrapper's ``classify`` (e.g.
         ``overlap_samples``, ``blinding``).
 
@@ -957,12 +1030,16 @@ def seisbench_picker(
         device = _auto_device()
 
     base, model_key = _resolve_seisbench_model(model, pretrained)
-    if author is None:
-        author = f"{model_key}_sb"
+    if method is None:
+        method = f"{model_key}_sb"
 
     runner = DASWaveformModelWrapper(base, component_strategy=component_strategy)
     runner.to(device)
     runner.eval()
+
+    # capture geometry up front (padding now preserves coords, but this keeps
+    # the pick rows independent of any later patch rebuilding)
+    x_arr, y_arr, z_arr = _geom_arrays(patch)
 
     window_s = _model_window_seconds(base)
     if window_s is not None:
@@ -1015,7 +1092,9 @@ def seisbench_picker(
         if plist:
             picks.extend(list(plist))
 
-    df = _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time)
+    df = _das_picks_to_df(
+        picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr
+    )
 
     if plot:
         n_ch = len(dist_vals)
@@ -1023,15 +1102,16 @@ def seisbench_picker(
         _plot_picks(patch, df, ch_idx, None, None, None)
 
     if db_save:
-        _save_to_catalog(df, file_name=file_name, author=author, db_path=db_path)
+        _save_to_store(df, file_name, method, db_path=db_path)
 
     return df
 
 
 def eqtransformer_picker(patch, pretrained="original", **kwargs):
     """EQTransformer P/S picks on a DAS patch. Thin wrapper over
-    :func:`seisbench_picker` with ``model="eqtransformer"`` (catalog author
-    "eqtransformer"). See ``seisbench_picker`` for all keyword arguments."""
+    :func:`seisbench_picker` with ``model="eqtransformer"`` (store method
+    "eqtransformer_sb"). See ``seisbench_picker`` for all keyword
+    arguments."""
     return seisbench_picker(
         patch, model="eqtransformer", pretrained=pretrained, **kwargs
     )

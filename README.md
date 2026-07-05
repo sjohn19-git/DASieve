@@ -39,6 +39,6 @@ sieve.picker.seisbench_picker(patch, model="eqtransformer", file_name="event.h5"
 | `dasieve.processing` | `to_strain_rate`, `decimate`, `cmd_remove`           |
 | `dasieve.qc`         | `compute_psd`, `plot_patch`                           |
 | `dasieve.picker`     | `trigger_picker`, `phasenet_picker`, `seisbench_picker` |
-| `dasieve.catalog`    | SQLite pick catalog (`save_picks`, `load_picks`)     |
+| `dasieve.store`      | SQLite pick catalog (`save_picks`, `load_picks_by_ids`) |
 | `dasieve.geometry`   | survey geometry attachment                           |
 | `dasieve.watcher`    | directory watcher for streaming ingest               |

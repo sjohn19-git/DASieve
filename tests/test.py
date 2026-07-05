@@ -94,8 +94,8 @@ df_eqt = sieve.picker.seisbench_picker(
     pretrained="original",
     min_prob=0.3,
     plot=True,
+    pad_short=True,
     file_name=source_file,
-    pad_short=True
 )
 
 
@@ -123,13 +123,13 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
     # ── run both pickers ──────────────────────────────────────────────────────
     t0 = time.perf_counter()
     df_mem = sieve.picker.phasenet_das_picker(
-        patch, min_prob=min_prob, plot=False, file_name=source_file, db_save=False
+        patch, min_prob=min_prob, plot=False, db_save=False
     )
     t_mem = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     df_disk = sieve.picker.phasenet_das_picker_disk(
-        patch, min_prob=min_prob, plot=False, file_name=source_file, db_save=False
+        patch, min_prob=min_prob, plot=False, db_save=False
     )
     t_disk = time.perf_counter() - t0
 
@@ -288,7 +288,8 @@ else:
             )
 
             df_pn = sieve.picker.phasenet_das_picker(
-                patch, min_prob=0.3, plot=True, plot_channel=None, file_name=source_file
+                patch, min_prob=0.3, plot=True, plot_channel=None,
+                file_name=source_file,
             )
 
             save_path = os.path.join(results_dir, f"{stem}_phasenet.png")

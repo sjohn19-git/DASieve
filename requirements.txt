@@ -15,3 +15,8 @@ torch            # backend for the deep-learning pickers
 #   it is not on PyPI -> initialise it with: git submodule update --init --recursive
 seisbench        # SeisBench pickers on DAS (dasieve.picker.seisbench_picker)
 xdas             # DAS data array required by SeisBench's DASWaveformModelWrapper
+
+# Phase association (dasieve.associator); not on PyPI -> installed from GitHub.
+# NOTE: the distribution is named "gmma" but the import is "gamma"
+# (from gamma.utils import association).
+gmma @ git+https://github.com/wayneweiqiang/GaMMA.git

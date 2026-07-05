@@ -24,6 +24,7 @@ dependencies = [
     "torch",        # backend for the deep-learning pickers
     "seisbench",    # SeisBench pickers on DAS (seisbench_picker)
     "xdas",         # DAS data array for DASWaveformModelWrapper
+    "gmma @ git+https://github.com/wayneweiqiang/GaMMA.git",  # phase association (associator); dist name is gmma, import is gamma
 ]
 
 [tool.setuptools.packages.find]

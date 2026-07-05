@@ -4,6 +4,6 @@
 #   import dasieve as sieve
 #   sieve.qc.compute_psd(patch)
 #   sieve.picker.seisbench_picker(patch, model="eqtransformer")
-from . import qc, picker, processing, catalog, watcher
+from . import qc, picker, processing, store, associator, watcher
 
-__all__ = ["qc", "picker", "processing", "catalog", "watcher"]
+__all__ = ["qc", "picker", "processing", "store", "associator", "watcher"]
