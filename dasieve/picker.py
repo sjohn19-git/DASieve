@@ -488,7 +488,6 @@ def phasenet_das_picker(
     eqnet_dir=DEFAULT_EQNET_DIR,
     min_prob=0.3,
     device=None,
-    phases=("P", "S"),
     highpass_filter=0.0,
     location=None,
     plot=False,
@@ -508,7 +507,6 @@ def phasenet_das_picker(
     eqnet_dir : path to the EQNet repo directory.
     min_prob : minimum phase probability threshold.
     device : "cuda" / "mps" / "cpu"; auto-detected if None.
-    phases : phase labels the model outputs, default ("P", "S").
     highpass_filter : highpass corner in Hz; 0.0 = no filter.
     location : pretrained model variant; None for default, "forge" for FORGE.
 
@@ -519,7 +517,7 @@ def phasenet_das_picker(
     ``"phasenetdas"``, replacing previous rows for (file_name, method).
     """
     import torch
-
+    phases=("P", "S")
     phases = list(phases)
     eqnet_dir = _ensure_eqnet_on_path(eqnet_dir)
 

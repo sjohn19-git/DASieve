@@ -160,6 +160,7 @@ def save_picks(df, file_name, method, db_path=DEFAULT_DB_PATH, replace=True):
 
     with _connect(db_path) as conn:
         if replace:
+            _drop_associations_referencing(conn, file_name, method)
             conn.execute(
                 "DELETE FROM picks WHERE file_name = ? AND method = ?;",
                 (file_name, method),
@@ -168,6 +169,45 @@ def save_picks(df, file_name, method, db_path=DEFAULT_DB_PATH, replace=True):
             conn.executemany(insert_sql, rows)
         conn.commit()
     return len(rows)
+
+
+def _drop_associations_referencing(conn, file_name, method):
+    """Delete association runs whose assignments reference picks about to be
+    replaced.
+
+    ``assignments.pick_id`` has a FOREIGN KEY to ``picks.id``, so the
+    replace-on-rerun delete in :func:`save_picks` would otherwise fail with an
+    IntegrityError -- and even without the constraint, association results
+    built on picks that no longer exist are stale. Each affected run is
+    removed whole (its ``events`` and ``assignments`` rows, keyed on the
+    run's own (file_name, method)); re-run the associator to regenerate it.
+    """
+    has_assignments = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='assignments';"
+    ).fetchone()
+    if not has_assignments:
+        return
+
+    runs = conn.execute(
+        "SELECT DISTINCT a.file_name, a.method FROM assignments a "
+        "JOIN picks p ON a.pick_id = p.id "
+        "WHERE p.file_name = ? AND p.method = ?;",
+        (file_name, method),
+    ).fetchall()
+    for run_file, run_method in runs:
+        conn.execute(
+            "DELETE FROM assignments WHERE file_name = ? AND method = ?;",
+            (run_file, run_method),
+        )
+        conn.execute(
+            "DELETE FROM events WHERE file_name = ? AND method = ?;",
+            (run_file, run_method),
+        )
+        print(
+            f"save_picks: dropped stale association run "
+            f"(file_name={run_file!r}, method={run_method!r}) that referenced "
+            f"the replaced picks -- re-run the associator to regenerate it"
+        )
 
 
 def select_pick_ids(
