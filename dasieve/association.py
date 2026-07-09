@@ -20,8 +20,8 @@ associated.
 
 Typical use::
 
-    from dasieve import associator
-    assoc = associator.GammaAssociator.from_preset("default", dbscan_eps=3.0)
+    from dasieve import association
+    assoc = association.GammaAssociator.from_preset("default", dbscan_eps=3.0)
     assoc.update_config(**{"x(km)": (4258.0, 4263.0)})   # optional edits
     catalog_df, assignments_df = assoc.run(
         pick_method="phasenetdas", file_name=".../event.h5", min_score=0.3,
@@ -32,12 +32,12 @@ Picks can also be supplied directly as a DataFrame (e.g. straight from a
 picker, without going through the store). This path never touches the
 database -- the events/assignments tables are only returned::
 
-    df = sieve.picker.trigger_picker(patch, db_save=False)
+    df = sieve.picking.trigger_picker(patch, db_save=False)
     catalog_df, assignments_df = assoc.run(picks=df)
 
 or the one-call convenience wrapper::
 
-    catalog_df, assignments_df = associator.run_association(
+    catalog_df, assignments_df = association.run_association(
         method="gamma", pick_method="phasenetdas", dbscan_eps=3.0,
     )
 
@@ -54,9 +54,8 @@ import pandas as pd
 
 from .store import (
     DEFAULT_DB_PATH,
-    load_picks_by_ids,
+    load_picks,
     save_associations,
-    select_pick_ids,
 )
 
 
@@ -112,6 +111,8 @@ class BaseAssociator(ABC):
         file_name=None,
         min_score=None,
         db_save=True,
+        plot=False,
+        patch=None,
     ):
         """Associate picks -- from a DataFrame, or selected from the store.
 
@@ -142,8 +143,8 @@ class BaseAssociator(ABC):
             Picks to associate directly, in the pickers' output schema (must
             include ``onset_time``, ``score``, ``phase``, ``distance``,
             ``x``, ``y``, ``z``), e.g. the DataFrame returned by
-            :func:`dasieve.picker.trigger_picker` or
-            :func:`dasieve.picker.phasenet_das_picker`. If there is no ``id``
+            :func:`dasieve.picking.trigger_picker` or
+            :func:`dasieve.picking.phasenet_das_picker`. If there is no ``id``
             column, row positions are used, so ``assignments_df["pick_id"]``
             indexes back into ``picks`` rows.
         detector : dasieve.detection.EventDetector, optional
@@ -165,6 +166,13 @@ class BaseAssociator(ABC):
         db_save : bool
             If True (default), save results to the events/assignments tables.
             Only applies when picks come from the store.
+        plot : bool
+            Draw :func:`plot_association` for the results: event locations on
+            the cable geometry next to the picks-on-data view colored by
+            event. Geometry comes from the picks' x/y/z, so it adapts to the
+            cable at hand.
+        patch : dascore.Patch, optional
+            Only used when ``plot=True``, as the waterfall background.
 
         Returns
         -------
@@ -189,7 +197,7 @@ class BaseAssociator(ABC):
                 "DataFrame (no database read/write)"
             )
         else:
-            pick_ids = select_pick_ids(
+            picks_df = load_picks(
                 db_path,
                 method=pick_method,
                 time_start=pick_starttime,
@@ -199,11 +207,10 @@ class BaseAssociator(ABC):
                 min_score=min_score,
             )
             print(
-                f"{self.name}.run: {len(pick_ids)} picks selected "
+                f"{self.name}.run: {len(picks_df)} picks selected "
                 f"(pick_method={pick_method!r}, "
                 f"window={pick_starttime!r}..{pick_endtime!r})"
             )
-            picks_df = load_picks_by_ids(pick_ids, db_path)
             from_store = True
 
         if detector is not None:
@@ -226,6 +233,14 @@ class BaseAssociator(ABC):
                 f"{self.name}.run: saved {n_ev} events / {n_as} assignments "
                 f"(file_name={save_key!r}, method={self.name!r})"
             )
+
+        if plot:
+            picks_ev = picks_df.merge(
+                assignments_df[["pick_id", "event_index"]],
+                left_on="id", right_on="pick_id", how="left",
+            )
+            plot_association(picks_ev, catalog_df, patch=patch,
+                             title=self.name)
 
         return catalog_df, assignments_df
 
@@ -490,6 +505,149 @@ class GammaAssociator(BaseAssociator):
 
 
 # ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def plot_association(picks_ev, catalog_df, patch=None, title=""):
+    """Event locations on the cable geometry | picks-on-data, event-colored.
+
+    Left: the fiber in 3D with one star per event (one color per event).
+    Right: picks over time/distance -- light gray = unassociated, colored =
+    its event (colors match the stars); drawn over the patch waterfall when
+    ``patch`` is given, otherwise on a plain scatter.
+
+    The fiber line comes from the patch's x/y/z coords only, so it adapts to
+    whatever cable the patch carries; when no patch (or a patch without
+    geometry) is given, the 3D panel shows just the event locations.
+    Coordinate convention (from :func:`dasieve.processing.load_survey`):
+    x = northing, y = easting, z = depth positive down -- plotted easting
+    horizontal, northing vertical, depth axis inverted.
+
+    Parameters
+    ----------
+    picks_ev : pandas.DataFrame
+        Picks with an ``event_index`` column (NaN = unassociated), i.e. the
+        associator's picks joined to its assignments on pick id.
+    catalog_df : pandas.DataFrame
+        Event catalog with ``event_index``, ``x(km)``, ``y(km)``, ``z(km)``.
+    patch : dascore.Patch, optional
+        Waterfall background (and fiber geometry, if it carries x/y/z).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator, ScalarFormatter
+
+    picks_ev = picks_ev.copy()
+    times = pd.to_datetime(picks_ev["onset_time"])
+
+    # fiber geometry (m -> km) from the patch only; without it the 3D panel
+    # shows event locations alone
+    geom = None
+    if patch is not None and {"x", "y", "z"} <= set(patch.coords.coord_map):
+        arrs = [np.asarray(patch.coords.get_array(c), float)
+                for c in ("x", "y", "z")]
+        if np.isfinite(arrs[0]).any():
+            geom = arrs
+
+    event_ids = sorted(picks_ev["event_index"].dropna().unique())
+    cmap = plt.get_cmap("tab10")
+    ev_color = {ev: cmap(k % 10) for k, ev in enumerate(event_ids)}
+
+    fig = plt.figure(figsize=(15, 6))
+    ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+    ax_w = fig.add_subplot(1, 2, 2)
+
+    # --- left: fiber (if the patch has geometry) + event locations
+    east_parts, north_parts, dep_parts = [], [], []
+    if geom is not None:
+        f_north, f_east, f_dep = (g / 1000.0 for g in geom)
+        ax3d.plot(f_east, f_north, f_dep, color="0.4", lw=1.5, label="fiber")
+        east_parts.append(f_east)
+        north_parts.append(f_north)
+        dep_parts.append(f_dep)
+    for ev in event_ids:
+        row = catalog_df[catalog_df["event_index"] == ev].iloc[0]
+        ax3d.scatter(row["y(km)"], row["x(km)"], row["z(km)"], s=120,
+                     marker="*", color=ev_color[ev], edgecolor="k",
+                     linewidths=0.5, label=f"event {int(ev)}")
+    if len(catalog_df):
+        east_parts.append(catalog_df["y(km)"].to_numpy(float))
+        north_parts.append(catalog_df["x(km)"].to_numpy(float))
+        dep_parts.append(catalog_df["z(km)"].to_numpy(float))
+
+    # per-cable extent with true spatial proportions
+    if east_parts:
+        lims = [
+            (np.nanmin(np.concatenate(v)) - 0.1,
+             np.nanmax(np.concatenate(v)) + 0.1)
+            for v in (east_parts, north_parts, dep_parts)
+        ]
+        ax3d.set_xlim(lims[0])
+        ax3d.set_ylim(lims[1])
+        ax3d.set_zlim(lims[2])
+        spans = [max(hi - lo, 1e-3) for lo, hi in lims]
+        ax3d.set_box_aspect(spans)
+        # tick count follows each axis's drawn length; full values (no offset)
+        for axis, span in zip((ax3d.xaxis, ax3d.yaxis, ax3d.zaxis), spans):
+            nbins = int(np.clip(round(6 * np.sqrt(span / max(spans))), 3, 5))
+            axis.set_major_locator(MaxNLocator(nbins))
+            fmt = axis.get_major_formatter()
+            if isinstance(fmt, ScalarFormatter):
+                fmt.set_useOffset(False)
+    ax3d.invert_zaxis()  # z is depth: shallowest on top
+    ax3d.tick_params(labelsize=7, pad=0)
+    ax3d.set_xlabel("Easting (km)", fontsize=8, labelpad=4)
+    ax3d.set_ylabel("Northing (km)", fontsize=8, labelpad=4)
+    ax3d.set_zlabel("depth (km)", fontsize=8, labelpad=2)
+    ax3d.set_title(f"{title}: event locations" if title else "event locations",
+                   fontsize=10)
+    ax3d.legend(fontsize=7, loc="upper left")
+
+    # --- right: picks on data
+    if patch is not None:
+        p_time = patch.coords.get_array("time")
+        p_dist = patch.coords.get_array("distance")
+        t0 = pd.Timestamp(p_time[0])
+        pt = (p_time - p_time[0]) / np.timedelta64(1, "s")
+        data2d = np.moveaxis(
+            patch.data,
+            [patch.dims.index("distance"), patch.dims.index("time")], [0, 1],
+        )
+        vmax = np.percentile(np.abs(data2d), 99)
+        ax_w.imshow(data2d, aspect="auto", cmap="gray",
+                    extent=(pt[0], pt[-1], p_dist[-1], p_dist[0]),
+                    vmin=-vmax, vmax=vmax, interpolation="nearest")
+    else:
+        t0 = times.min()
+        ax_w.invert_yaxis()
+    picks_ev["t_s"] = (times - t0).dt.total_seconds()
+
+    un = picks_ev[picks_ev["event_index"].isna()]
+    if len(un):
+        ax_w.scatter(un["t_s"], un["distance"], marker="|", s=25,
+                     linewidths=0.8, color="0.75",
+                     label=f"unassociated ({len(un)})", zorder=3)
+    asc = picks_ev.dropna(subset=["event_index"])
+    if len(asc):
+        ax_w.scatter(asc["t_s"], asc["distance"], marker="|", s=40,
+                     linewidths=1.2, zorder=4,
+                     c=[ev_color[e] for e in asc["event_index"]])
+    for ev in event_ids:
+        n = int((asc["event_index"] == ev).sum())
+        ax_w.scatter([], [], marker="|", s=40, linewidths=1.2,
+                     color=ev_color[ev], label=f"event {int(ev)} ({n})")
+    ax_w.set_xlabel("Time (s)")
+    ax_w.set_ylabel("Distance (m)")
+    ax_w.set_title(
+        (f"{title}: " if title else "")
+        + "picks on data (gray = unassociated)"
+    )
+    ax_w.legend(loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Registry + convenience wrapper
 # ---------------------------------------------------------------------------
 #: method id -> associator class. New associators register here so callers can
@@ -524,6 +682,8 @@ def run_association(
     phase=None,
     file_name=None,
     min_score=None,
+    plot=False,
+    patch=None,
     **config_overrides,
 ):
     """Build an associator, select picks, associate, and (optionally) save in
@@ -550,4 +710,6 @@ def run_association(
         file_name=file_name,
         min_score=min_score,
         db_save=save,
+        plot=plot,
+        patch=patch,
     )

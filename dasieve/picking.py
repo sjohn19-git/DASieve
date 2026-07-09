@@ -149,7 +149,7 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
         data_dt,
         aspect="auto",
         extent=extent,
-        cmap="RdBu",
+        cmap="gray",
         vmin=-vmax,
         vmax=vmax,
         interpolation="nearest",

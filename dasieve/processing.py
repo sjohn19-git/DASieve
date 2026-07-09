@@ -350,7 +350,7 @@ def _plot_decimation(
         im = ax_im.imshow(
             plot_data,
             aspect="auto",
-            cmap="RdBu_r",
+            cmap="gray",
             vmin=-vmax,
             vmax=vmax,
             extent=[t_s[0], t_s[-1], float(dist[-1]), float(dist[0])],

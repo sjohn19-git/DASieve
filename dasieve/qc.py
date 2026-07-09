@@ -239,7 +239,7 @@ def plot_patch(
     patch: dc.Patch,
     vmin: float | None = None,
     vmax: float | None = None,
-    cmap: str = "RdBu_r",
+    cmap: str = "gray",
     channel_idx: int | None = None,
     space_dim: str = "distance",
     show: bool = False,

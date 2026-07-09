@@ -1,7 +1,7 @@
 """SQLite store for DAS picks and association results.
 
 A single flat ``picks`` table stores every pick produced by the pickers in
-:mod:`dasieve.picker`, labelled with the source ``file_name`` and the
+:mod:`dasieve.picking`, labelled with the source ``file_name`` and the
 ``method`` (the picking method, e.g. "sta_lta", "phasenetdas"). Re-running
 with the same ``(file_name, method)`` pair *replaces* the previous rows for
 that pair -- no duplicates accumulate. The ``events`` / ``assignments``
@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .picker import PICK_COLUMNS
+from .picking import PICK_COLUMNS
 
 DEFAULT_DB_PATH = os.path.join(os.path.expanduser("~/DASieve"), "dasieve.sqlite")
 
@@ -124,7 +124,7 @@ def save_picks(df, file_name, method, db_path=DEFAULT_DB_PATH, replace=True):
     Parameters
     ----------
     df : pandas.DataFrame
-        Output of a picker (columns == dasieve.picker.PICK_COLUMNS). May be
+        Output of a picker (columns == dasieve.picking.PICK_COLUMNS). May be
         empty (the previous picks for this file+method are still cleared when
         ``replace`` is True, so the store reflects the latest empty result).
     file_name : str
@@ -215,7 +215,7 @@ def select_pick_ids(
     """Return the ``picks.id`` values matching the filters.
 
     This is the single place where "which picks?" is decided; consumers
-    (e.g. :mod:`dasieve.associator`, future locators) take the returned ids
+    (e.g. :mod:`dasieve.association`, future locators) take the returned ids
     and load the rows they need via :func:`load_picks_by_ids`.
 
     Parameters
@@ -304,6 +304,34 @@ def load_picks_by_ids(pick_ids, db_path=DEFAULT_DB_PATH):
     return df.sort_values("onset_time", ignore_index=True)
 
 
+def load_picks(
+    db_path=DEFAULT_DB_PATH,
+    *,
+    method=None,
+    time_start=None,
+    time_end=None,
+    phase=None,
+    file_name=None,
+    min_score=None,
+):
+    """Select and load picks in one call.
+
+    Convenience wrapper: :func:`select_pick_ids` with the same filters,
+    followed by :func:`load_picks_by_ids`. Returns the picks DataFrame
+    (including the ``id`` column), ordered by onset_time.
+    """
+    pick_ids = select_pick_ids(
+        db_path,
+        method=method,
+        time_start=time_start,
+        time_end=time_end,
+        phase=phase,
+        file_name=file_name,
+        min_score=min_score,
+    )
+    return load_picks_by_ids(pick_ids, db_path)
+
+
 # ---------------------------------------------------------------------------
 # Association results (events / assignments tables)
 # ---------------------------------------------------------------------------
@@ -361,7 +389,7 @@ def save_associations(
 ):
     """Persist an association run to the ``events`` / ``assignments`` tables.
 
-    Normally called automatically by :meth:`dasieve.associator.BaseAssociator.run`
+    Normally called automatically by :meth:`dasieve.association.BaseAssociator.run`
     (``db_save=True``), which fills ``file_name`` and ``method`` from what it
     was called with. Existing rows with the same (file_name, method) are
     deleted first (replace-on-rerun, like :func:`save_picks`), so re-running

@@ -4,7 +4,7 @@ Scans pick onset times with a sliding detection window and emits
 non-overlapping association windows wherever enough of the fiber picked at
 the same time. The windows gate association: only picks inside an emitted
 window are handed to an associator (see ``detector=`` / ``windows=`` on
-:meth:`dasieve.associator.BaseAssociator.run`).
+:meth:`dasieve.association.BaseAssociator.run`).
 
 Two trigger mechanisms, selected by ``method``:
 
@@ -53,7 +53,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .store import DEFAULT_DB_PATH, load_picks_by_ids, select_pick_ids
+from .store import DEFAULT_DB_PATH, load_picks
 
 #: Columns of the windows DataFrame returned by :meth:`EventDetector.detect`.
 WINDOW_COLUMNS = ["t_start", "t_end", "n_picks", "n_channels", "n_votes"]
@@ -246,7 +246,7 @@ class EventDetector:
         triggered, and ``n_votes`` (NaN for ``method="count"``).
         """
         if picks is None:
-            pick_ids = select_pick_ids(
+            picks = load_picks(
                 db_path,
                 method=pick_method,
                 time_start=pick_starttime,
@@ -255,7 +255,6 @@ class EventDetector:
                 file_name=file_name,
                 min_score=min_score,
             )
-            picks = load_picks_by_ids(pick_ids, db_path)
             print(f"EventDetector.detect: {len(picks)} picks selected from store")
 
         empty = pd.DataFrame(columns=WINDOW_COLUMNS)

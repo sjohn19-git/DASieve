@@ -52,7 +52,7 @@ patch = sieve.processing.decimate(
 freqs, psd_db = sieve.qc.compute_psd(patch, plot=True, vmax=0.8, ylim=(-160, -132.5))
 
 
-df_trig = sieve.picker.trigger_picker(
+df_trig = sieve.picking.trigger_picker(
     patch,
     sta=0.3,
     lta=2.0,
@@ -63,7 +63,7 @@ df_trig = sieve.picker.trigger_picker(
     file_name=source_file,
 )
 
-# df_ar = sieve.picker.trigger_picker(
+# df_ar = sieve.picking.trigger_picker(
 #     patch,
 #     method="ar",
 #     f1=100.0,
@@ -82,13 +82,13 @@ df_trig = sieve.picker.trigger_picker(
 #     file_name=source_file,
 # )
 
-df_pn = sieve.picker.phasenet_das_picker(
+df_pn = sieve.picking.phasenet_das_picker(
     patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
 )
 
 # EQTransformer (SeisBench) on the same patch, visualized with the shared
 # picker plotter. device auto-detects MPS on Apple Silicon.
-df_eqt = sieve.picker.seisbench_picker(
+df_eqt = sieve.picking.seisbench_picker(
     patch,
     model="eqtransformer",
     pretrained="original",
@@ -100,7 +100,7 @@ df_eqt = sieve.picker.seisbench_picker(
 
 
 # string key — loads pretrained weights automatically
-df = sieve.picker.seisbench_picker(
+df = sieve.picking.seisbench_picker(
     patch,
     model="phasenet",
     pretrained="original",
@@ -122,13 +122,13 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
 
     # ── run both pickers ──────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    df_mem = sieve.picker.phasenet_das_picker(
+    df_mem = sieve.picking.phasenet_das_picker(
         patch, min_prob=min_prob, plot=False, db_save=False
     )
     t_mem = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    df_disk = sieve.picker.phasenet_das_picker_disk(
+    df_disk = sieve.picking.phasenet_das_picker_disk(
         patch, min_prob=min_prob, plot=False, db_save=False
     )
     t_disk = time.perf_counter() - t0
@@ -182,7 +182,7 @@ def test_phasenet(patch, source_file=None, min_prob=0.3, max_match_s=1.0):
             data2d,
             aspect="auto",
             extent=extent,
-            cmap="RdBu",
+            cmap="gray",
             vmin=-vmax,
             vmax=vmax,
             interpolation="nearest",
@@ -287,7 +287,7 @@ else:
                 patch, dim="distance", window=5000, method="median"
             )
 
-            df_pn = sieve.picker.phasenet_das_picker(
+            df_pn = sieve.picking.phasenet_das_picker(
                 patch, min_prob=0.3, plot=True, plot_channel=None,
                 file_name=source_file,
             )

@@ -7,18 +7,17 @@ dasieve.sqlite) -> select picks from the store -> GaMMA association ->
 event-colored waterfall + event location map.
 
 Run cell-by-cell in VS Code / Jupyter, or top-to-bottom:
-    python tests/test_associator.py
+    python tests/test_association.py
 """
 
 import logging
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import dascore as dc
 
 import dasieve as sieve
-from dasieve import associator, detection, store
+from dasieve import association, detection, store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,18 +59,18 @@ logging.info("geometry after preprocessing: %d/%d channels have x/y/z",
 # saves automatically to the store (method="phasenetdas"); re-running the
 # same file replaces its previous phasenetdas picks
 
-df_trig = sieve.picker.trigger_picker(
+df_trig = sieve.picking.trigger_picker(
     patch,
     sta=0.3,
     lta=2.0,
     thr_on=4.0,
     thr_off=1,
-    plot=True,
+    plot=False,
     plot_channel=None,
     file_name=source_file,
 )
 
-df_pn = sieve.picker.phasenet_das_picker(
+df_pn = sieve.picking.phasenet_das_picker(
     patch, min_prob=0.3, plot=False, file_name=source_file,plot_channel=10
 )
 logging.info("PhaseNet-DAS: %d picks (P=%d, S=%d)", len(df_pn),
@@ -81,7 +80,7 @@ logging.info("PhaseNet-DAS: %d picks (P=%d, S=%d)", len(df_pn),
 # 3. Select picks from the store and run GaMMA
 # ----------------------------------------------------------------------------
 
-assoc = associator.GammaAssociator.from_preset(
+assoc = association.GammaAssociator.from_preset(
     "default",
     dbscan_eps=3.0,
     dbscan_min_samples=5,
@@ -95,6 +94,8 @@ catalog_df, assignments_df = assoc.run(
     pick_method="phasenetdas",   # whose picks to associate
     file_name=source_file,
     min_score=0.3,
+    plot=True,
+    patch=patch,
 )
 logging.info("GaMMA: %d events, %d associated picks",
              len(catalog_df), len(assignments_df))
@@ -110,14 +111,17 @@ if len(catalog_df):
 #      database, the event/assignment tables are only returned;
 #      assignments' pick_id indexes back into df_trig rows)
 # ----------------------------------------------------------------------------
-assoc_trig = associator.GammaAssociator.from_preset(
+assoc_trig = association.GammaAssociator.from_preset(
     "default",
     dbscan_eps=3.0,
     dbscan_min_samples=5,
     min_picks_per_eq=100,
     vel={"p": 6.0, "s": 6.0 / 1.75},
 )
-catalog_trig, assignments_trig = assoc_trig.run(picks=df_trig)
+# plot=True draws the built-in association figure (event locations on the
+# cable geometry | picks-on-data colored by event); patch = waterfall bg
+catalog_trig, assignments_trig = assoc_trig.run(picks=df_trig, plot=True,
+                                                patch=patch)
 logging.info("GaMMA on STA/LTA triggers: %d events, %d associated picks",
              len(catalog_trig), len(assignments_trig))
 if len(catalog_trig):
@@ -131,12 +135,13 @@ if len(catalog_trig):
 #     picked inside a sliding window (see dasieve/detection.py)
 # ----------------------------------------------------------------------------
 det = detection.EventDetector(
-    method="vote",            # or "count" with min_channels=...
+    method="count",           # or "vote" (uses the segment params below)
     window=0.5,               # detection window (s)
     stride=0.25,              # detection stride (s), overlapping
     look_ahead=2.0,           # emitted association window (s)
-    n_segments=8,
-    seg_min_channels=3,       # distinct channels for a segment to vote True
+    min_channels=20,          # count: distinct channels to trigger
+    n_segments=8,             # vote: segment layout
+    seg_min_channels=3,       # vote: distinct channels for a True vote
     min_votes=5,
     channels=patch.coords.get_array("distance"),
 )
@@ -150,6 +155,9 @@ catalog_det, assignments_det = assoc_trig.run(picks=df_trig, windows=windows)
 logging.info("gated GaMMA on STA/LTA: %d events, %d associated picks",
              len(catalog_det), len(assignments_det))
 # equivalent one-step form: assoc_trig.run(picks=df_trig, detector=det)
+
+
+
 
 # %% ------------------------------------------------------------------------
 # 4. Compare events + associations between the two pick types
@@ -253,10 +261,8 @@ def matched_pick_overlap(matched, picks_ev_a, picks_ev_b):
 
 # per-pick event_index for both runs: PhaseNet picks reloaded from the store
 # (same filters as the association run), STA/LTA picks straight from df_trig
-picks_pn = store.load_picks_by_ids(
-    store.select_pick_ids(method="phasenetdas", file_name=source_file,
-                          min_score=0.3)
-)
+picks_pn = store.load_picks(method="phasenetdas", file_name=source_file,
+                            min_score=0.3)
 picks_ev_pn = merge_assignments(picks_pn, assignments_df)
 picks_ev_trig = merge_assignments(df_trig, assignments_trig)
 
@@ -284,143 +290,7 @@ if len(matched):
     print("\n=== per-event association overlap ===")
     print(overlap.to_string(index=False))
 
-# %% ------------------------------------------------------------------------
-# 5. Events on top of the data
-#    left:  well geometry + event locations (one color per event, depth down)
-#    right: waterfall imshow + picks -- gray = unassociated, colored = its
-#           event (colors match the left panel)
-# ----------------------------------------------------------------------------
-
-def geom_limits(patch, catalogs, pad_km=0.1):
-    """Shared 3D extent -- (easting, northing, depth) (lo, hi) pairs in km --
-    covering the fiber and every catalog's events, so multiple figures use
-    identical axis limits and stay visually comparable."""
-    east = [np.asarray(patch.coords.get_array("y"), float) / 1000.0]
-    north = [np.asarray(patch.coords.get_array("x"), float) / 1000.0]
-    dep = [np.asarray(patch.coords.get_array("z"), float) / 1000.0]
-    for cat in catalogs:
-        if len(cat):
-            east.append(cat["y(km)"].to_numpy())
-            north.append(cat["x(km)"].to_numpy())
-            dep.append(cat["z(km)"].to_numpy())
-    lims = []
-    for vals in (np.concatenate(east), np.concatenate(north),
-                 np.concatenate(dep)):
-        lims.append((np.nanmin(vals) - pad_km, np.nanmax(vals) + pad_km))
-    return lims
-
-
-def plot_events_on_data(patch, picks_ev, catalog_df, title="", lims=None):
-    """Waterfall + picks colored by event, next to the event locations.
-
-    picks_ev comes from :func:`merge_assignments` (event_index NaN =
-    unassociated). Picks are drawn with two scatter calls (one gray for
-    unassociated, one vectorized-color for associated), so it stays fast for
-    thousands of picks. z is depth (positive down) -> 3D z-axis inverted.
-
-    lims : optional (easting, northing, depth) (lo, hi) pairs from
-        :func:`geom_limits`; pass the same value to several calls to keep
-        the 3D axes identical across figures. Default: this run's extent.
-    """
-    time_vals = patch.coords.get_array("time")
-    dist_vals = patch.coords.get_array("distance")
-    t0 = pd.Timestamp(time_vals[0])
-    t_sec = (time_vals - time_vals[0]) / np.timedelta64(1, "s")
-    data2d = np.moveaxis(
-        patch.data,
-        [patch.dims.index("distance"), patch.dims.index("time")], [0, 1],
-    )
-    vmax = np.percentile(np.abs(data2d), 99)
-    extent = (t_sec[0], t_sec[-1], dist_vals[-1], dist_vals[0])
-
-    picks_ev = picks_ev.copy()
-    picks_ev["t_s"] = (
-        pd.to_datetime(picks_ev["onset_time"]) - t0
-    ).dt.total_seconds()
-    event_ids = sorted(picks_ev["event_index"].dropna().unique())
-    cmap = plt.get_cmap("tab10")
-    ev_color = {ev: cmap(k % 10) for k, ev in enumerate(event_ids)}
-
-    fig = plt.figure(figsize=(15, 6))
-    ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-    ax_w = fig.add_subplot(1, 2, 2)
-
-    # --- left: well geometry + event locations (m -> km)
-    # survey convention (see well_plot.py): the survey's x_m column is
-    # NORTHING (xN ~ 4.26e6 m) and y_m is EASTING (yE ~ 3.3e5 m), so plot
-    # easting on the horizontal axis and northing on the vertical to get a
-    # real map view -- same as well_plot.py's scatter(yE, xN, -tvd)
-    f_north = np.asarray(patch.coords.get_array("x"), float) / 1000.0
-    f_east = np.asarray(patch.coords.get_array("y"), float) / 1000.0
-    f_dep = np.asarray(patch.coords.get_array("z"), float) / 1000.0
-    ax3d.plot(f_east, f_north, f_dep, color="0.4", lw=1.5, label="fiber")
-    for ev in event_ids:
-        row = catalog_df[catalog_df["event_index"] == ev].iloc[0]
-        ax3d.scatter(row["y(km)"], row["x(km)"], row["z(km)"], s=120,
-                     marker="*", color=ev_color[ev], edgecolor="k",
-                     linewidths=0.5, label=f"event {int(ev)}")
-    # fixed limits + true spatial proportions: without the aspect the
-    # ~0.3 km lateral deviation is stretched to match the 2.4 km depth and
-    # the well looks bent
-    if lims is None:
-        lims = geom_limits(patch, [catalog_df])
-    (e_lim, n_lim, d_lim) = lims
-    ax3d.set_xlim(e_lim)
-    ax3d.set_ylim(n_lim)
-    ax3d.set_zlim(d_lim)
-    ax3d.set_box_aspect([max(hi - lo, 1e-3) for lo, hi in lims])
-    ax3d.invert_zaxis()  # z is depth: wellhead (z=0) on top
-    # small tick/label text, full coordinate values (no "+4.263e3" offset);
-    # tick count follows each axis's drawn length (true-proportion aspect
-    # makes the northing axis short -- 5 ticks there collide)
-    spans = [max(hi - lo, 1e-3) for lo, hi in lims]
-    for axis, span in zip((ax3d.xaxis, ax3d.yaxis, ax3d.zaxis), spans):
-        nbins = int(np.clip(round(6 * np.sqrt(span / max(spans))), 3, 5))
-        axis.set_major_locator(plt.MaxNLocator(nbins))
-        axis.get_major_formatter().set_useOffset(False)
-    ax3d.tick_params(labelsize=7, pad=0)
-    ax3d.set_xlabel("Easting (km)", fontsize=8, labelpad=4)
-    ax3d.set_ylabel("Northing (km)", fontsize=8, labelpad=4)
-    ax3d.set_zlabel("depth (km)", fontsize=8, labelpad=2)
-    ax3d.set_title(f"{title}: event locations", fontsize=10)
-    ax3d.legend(fontsize=7, loc="upper left")
-
-    # --- right: waterfall + picks
-    ax_w.imshow(data2d, aspect="auto", extent=extent, cmap="gray",
-                vmin=-vmax, vmax=vmax, interpolation="nearest")
-    un = picks_ev[picks_ev["event_index"].isna()]
-    if len(un):
-        ax_w.scatter(un["t_s"], un["distance"], marker="|", s=25,
-                     linewidths=0.8, color="0.75",
-                     label=f"unassociated ({len(un)})", zorder=3)
-    asc = picks_ev.dropna(subset=["event_index"])
-    if len(asc):
-        ax_w.scatter(asc["t_s"], asc["distance"], marker="|", s=40,
-                     linewidths=1.2, zorder=4,
-                     c=[ev_color[e] for e in asc["event_index"]])
-    # legend swatches per event, colors matching the 3D panel
-    for ev in event_ids:
-        n = int((asc["event_index"] == ev).sum())
-        ax_w.scatter([], [], marker="|", s=40, linewidths=1.2,
-                     color=ev_color[ev], label=f"event {int(ev)} ({n})")
-    ax_w.set_xlabel("Time (s)")
-    ax_w.set_ylabel("Distance (m)")
-    ax_w.set_title(f"{title}: picks on data (gray = unassociated)")
-    ax_w.legend(loc="upper right", fontsize=8)
-
-    plt.tight_layout()
-    plt.show()
-    return fig
-
-
-# one shared 3D extent (fiber + both catalogs) so the two figures are
-# directly comparable; assigning the returned figures also stops Jupyter
-# from re-displaying the last one as the cell output
-lims = geom_limits(patch, [catalog_df, catalog_trig])
-fig_pn = plot_events_on_data(patch, picks_ev_pn, catalog_df,
-                             title="PhaseNet-DAS + GaMMA", lims=lims)
-fig_trig = plot_events_on_data(patch, picks_ev_trig, catalog_trig,
-                               title="STA/LTA + GaMMA", lims=lims)
-
+# per-run figures now come from the associator itself:
+# run(..., plot=True, patch=patch) -> association.plot_association
 
 # %%
