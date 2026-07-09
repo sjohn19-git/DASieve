@@ -32,8 +32,8 @@ DEFAULT_DB_PATH = os.path.join(os.path.expanduser("~/DASieve"), "dasieve.sqlite"
 _META_COLUMNS = ["file_name", "method", "created_at"]
 _TABLE_COLUMNS = _META_COLUMNS + list(PICK_COLUMNS)
 
-# Column -> SQLite type. onset_time / off_time are stored as ISO-8601 text
-# (sortable); sample indices as INTEGER; everything else REAL/TEXT.
+# Column -> SQLite type. onset_time is stored as ISO-8601 text (sortable);
+# the sample index as INTEGER; everything else REAL/TEXT.
 _COLUMN_TYPES = {
     "file_name": "TEXT NOT NULL",
     "method": "TEXT NOT NULL",
@@ -46,10 +46,6 @@ _COLUMN_TYPES = {
     "onset_sample": "INTEGER",
     "onset_time": "TEXT",
     "score": "REAL",
-    "cft_at_onset": "REAL",
-    "off_sample": "INTEGER",
-    "off_time": "TEXT",
-    "cft_at_off": "REAL",
 }
 
 
@@ -117,10 +113,6 @@ def _prepare_rows(df, file_name, method, created_at):
                 _int_or_none(r.get("onset_sample")),
                 _iso_or_none(r.get("onset_time")),
                 _float_or_none(r.get("score")),
-                _float_or_none(r.get("cft_at_onset")),
-                _int_or_none(r.get("off_sample")),
-                _iso_or_none(r.get("off_time")),
-                _float_or_none(r.get("cft_at_off")),
             )
         )
     return rows
@@ -287,8 +279,8 @@ _SQL_CHUNK = 900
 def load_picks_by_ids(pick_ids, db_path=DEFAULT_DB_PATH):
     """Load pick rows for the given ``picks.id`` values into a DataFrame.
 
-    ``onset_time`` / ``off_time`` are parsed to datetime; rows come back
-    ordered by onset_time. Unknown ids are silently absent from the result.
+    ``onset_time`` is parsed to datetime; rows come back ordered by
+    onset_time. Unknown ids are silently absent from the result.
     """
     pick_ids = [int(i) for i in pick_ids]
     if not pick_ids:
@@ -307,9 +299,8 @@ def load_picks_by_ids(pick_ids, db_path=DEFAULT_DB_PATH):
                 )
             )
     df = pd.concat(frames, ignore_index=True)
-    for col in ("onset_time", "off_time"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+    if "onset_time" in df.columns:
+        df["onset_time"] = pd.to_datetime(df["onset_time"], errors="coerce")
     return df.sort_values("onset_time", ignore_index=True)
 
 

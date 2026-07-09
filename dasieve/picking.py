@@ -23,10 +23,6 @@ PICK_COLUMNS = [
     "onset_sample",
     "onset_time",
     "score",
-    "cft_at_onset",
-    "off_sample",
-    "off_time",
-    "cft_at_off",
 ]
 
 
@@ -85,16 +81,8 @@ def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
     cft = classic_sta_lta(trace.data, nsta, nlta)
 
     picks = []
-    for on, off in trigger_onset(cft, thr_on, thr_off):
-        picks.append(
-            {
-                "phase": "trigger",
-                "onset_sample": int(on),
-                "off_sample": int(off),
-                "cft_at_onset": cft[on],
-                "cft_at_off": cft[off],
-            }
-        )
+    for on, _off in trigger_onset(cft, thr_on, thr_off):
+        picks.append({"phase": "P", "onset_sample": int(on)})
     return picks, cft
 
 
@@ -142,7 +130,7 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
     time_vals = patch.coords.get_array("time")
     t_sec = (time_vals - time_vals[0]) / np.timedelta64(1, "s")
 
-    phase_color = {"P": "blue", "S": "red", "trigger": "blue"}
+    phase_color = {"P": "blue", "S": "red"}
 
     # patch data oriented as (distance, time) for imshow
     time_axis = patch.dims.index("time")
@@ -200,14 +188,6 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
             linestyle="--",
             label=phase,
         )
-        # draw trigger-off marker only for STA/LTA triggers
-        if phase == "trigger" and not pd.isna(row.get("off_sample")):
-            ax_trace.axvline(
-                t_sec[int(row["off_sample"])],
-                color="red",
-                linewidth=1,
-                linestyle="--",
-            )
     ax_trace.set_ylabel("Amplitude")
     # de-duplicate legend labels
     handles, labels = ax_trace.get_legend_handles_labels()
@@ -266,7 +246,8 @@ def trigger_picker(
 ):
     """Pick arrivals on a DAS patch.
 
-    method : "sta_lta" (classic STA/LTA + trigger_onset) or
+    method : "sta_lta" (classic STA/LTA + trigger_onset; each trigger onset is
+             labeled as a P pick) or
              "ar" (AR-AIC P/S picker; single-component data is passed for all
              three ar_pick components).
 
@@ -311,7 +292,6 @@ def trigger_picker(
 
         for p in picks:
             on = p["onset_sample"]
-            off = p.get("off_sample")
             rows.append(
                 {
                     "distance": dist_vals[i],
@@ -322,10 +302,6 @@ def trigger_picker(
                     "onset_sample": on,
                     "onset_time": time_vals[on],
                     "score": p.get("score", np.nan),
-                    "cft_at_onset": p.get("cft_at_onset", np.nan),
-                    "off_sample": off,
-                    "off_time": time_vals[off] if off is not None else np.nan,
-                    "cft_at_off": p.get("cft_at_off", np.nan),
                 }
             )
 
@@ -739,10 +715,6 @@ def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_
                 "onset_sample": smp,
                 "onset_time": time_vals[smp],
                 "score": float(r["phase_score"]),
-                "cft_at_onset": np.nan,
-                "off_sample": np.nan,
-                "off_time": np.nan,
-                "cft_at_off": np.nan,
             }
         )
 
@@ -908,10 +880,6 @@ def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_ar
                 "onset_sample": smp,
                 "onset_time": time_vals[smp],
                 "score": float(p.confidence),
-                "cft_at_onset": np.nan,
-                "off_sample": np.nan,
-                "off_time": np.nan,
-                "cft_at_off": np.nan,
             }
         )
 

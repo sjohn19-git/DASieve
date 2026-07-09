@@ -14,8 +14,9 @@ not shared by other associators), so config lives on the associator instance
 rather than as free-floating module functions. Only :class:`GammaAssociator`
 is implemented so far.
 
-Association is intended for P/S methods ("phasenet", "*_sb", "ar"); STA/LTA
-picks carry ``phase="trigger"`` and will not associate meaningfully.
+Every picker emits P/S phase labels ("phasenet", "*_sb", "ar"; STA/LTA
+labels each trigger onset as a P pick), so any picker's output can be
+associated.
 
 Typical use::
 
@@ -26,6 +27,13 @@ Typical use::
         pick_method="phasenetdas", file_name=".../event.h5", min_score=0.3,
     )   # saves to events/assignments automatically (db_save=True),
         # replacing previous results for the same (file_name, method)
+
+Picks can also be supplied directly as a DataFrame (e.g. straight from a
+picker, without going through the store). This path never touches the
+database -- the events/assignments tables are only returned::
+
+    df = sieve.picker.trigger_picker(patch, db_save=False)
+    catalog_df, assignments_df = assoc.run(picks=df)
 
 or the one-call convenience wrapper::
 
@@ -88,11 +96,15 @@ class BaseAssociator(ABC):
 
         Returns ``(catalog_df, assignments_df)`` where ``assignments_df`` has
         a ``pick_id`` column mapping each row back to ``picks.id``."""
+        raise NotImplementedError
 
     def run(
         self,
         db_path=DEFAULT_DB_PATH,
         *,
+        picks=None,
+        detector=None,
+        windows=None,
         pick_method=None,
         pick_starttime=None,
         pick_endtime=None,
@@ -101,19 +113,45 @@ class BaseAssociator(ABC):
         min_score=None,
         db_save=True,
     ):
-        """Select picks from the store, associate them, and save.
+        """Associate picks -- from a DataFrame, or selected from the store.
 
-        Selection is delegated to :func:`dasieve.store.select_pick_ids`; the
-        number of selected picks is printed before association runs. When
-        ``db_save`` is True (default) results are written to the
-        events/assignments tables via :func:`dasieve.store.save_associations`,
-        keyed on (file_name, ``self.name``) -- re-running on the same data
-        replaces the previous results instead of duplicating them.
+        When ``picks`` is given, that DataFrame is associated directly: the
+        database is not touched at all (no selection, no save; the pick
+        filters and ``db_save`` are ignored) and the events/assignments
+        tables are only returned.
+
+        Otherwise selection is delegated to
+        :func:`dasieve.store.select_pick_ids`; the number of selected picks is
+        printed before association runs. When ``db_save`` is True (default)
+        results are written to the events/assignments tables via
+        :func:`dasieve.store.save_associations`, keyed on
+        (file_name, ``self.name``) -- re-running on the same data replaces the
+        previous results instead of duplicating them.
+
+        Either way, association can be gated by detection windows: pass
+        ``detector`` (an :class:`dasieve.detection.EventDetector`, run here on
+        the same picks) or precomputed ``windows``. Association then runs once
+        per window on the picks inside it; picks outside every window are
+        never associated. ``event_index`` stays unique across windows.
 
         Parameters
         ----------
         db_path : str
             Catalog database holding the picks.
+        picks : pandas.DataFrame, optional
+            Picks to associate directly, in the pickers' output schema (must
+            include ``onset_time``, ``score``, ``phase``, ``distance``,
+            ``x``, ``y``, ``z``), e.g. the DataFrame returned by
+            :func:`dasieve.picker.trigger_picker` or
+            :func:`dasieve.picker.phasenet_das_picker`. If there is no ``id``
+            column, row positions are used, so ``assignments_df["pick_id"]``
+            indexes back into ``picks`` rows.
+        detector : dasieve.detection.EventDetector, optional
+            Run on the picks to produce detection windows that gate the
+            association. Mutually exclusive with ``windows``.
+        windows : pandas.DataFrame or iterable of (start, end), optional
+            Precomputed association windows (as returned by
+            :meth:`EventDetector.detect`, or any (t_start, t_end) pairs).
         pick_method : str or list of str, optional
             Which picker's picks to associate (the ``picks.method`` column,
             e.g. "phasenetdas") -- NOT the associator.
@@ -126,6 +164,7 @@ class BaseAssociator(ABC):
             file_name "all" when no file filter is set.
         db_save : bool
             If True (default), save results to the events/assignments tables.
+            Only applies when picks come from the store.
 
         Returns
         -------
@@ -134,27 +173,50 @@ class BaseAssociator(ABC):
             gamma_score, sigma_time, magnitude, number_picks, ...).
             ``assignments_df`` -- ``pick_index``, ``event_index``,
             ``gamma_score``, plus ``pick_id`` mapping each row back to
-            ``picks.id`` in the store database.
+            ``picks.id`` in the store database (or to the row position in
+            ``picks`` when a DataFrame was supplied without an ``id`` column).
         """
-        pick_ids = select_pick_ids(
-            db_path,
-            method=pick_method,
-            time_start=pick_starttime,
-            time_end=pick_endtime,
-            phase=phase,
-            file_name=file_name,
-            min_score=min_score,
-        )
-        print(
-            f"{self.name}.run: {len(pick_ids)} picks selected "
-            f"(pick_method={pick_method!r}, "
-            f"window={pick_starttime!r}..{pick_endtime!r})"
-        )
+        if detector is not None and windows is not None:
+            raise ValueError("pass either detector= or windows=, not both")
 
-        picks_df = load_picks_by_ids(pick_ids, db_path)
-        catalog_df, assignments_df = self._associate(picks_df)
+        if picks is not None:
+            picks_df = picks.reset_index(drop=True)
+            if "id" not in picks_df.columns:
+                picks_df = picks_df.assign(id=np.arange(len(picks_df)))
+            from_store = False
+            print(
+                f"{self.name}.run: {len(picks_df)} picks supplied as a "
+                "DataFrame (no database read/write)"
+            )
+        else:
+            pick_ids = select_pick_ids(
+                db_path,
+                method=pick_method,
+                time_start=pick_starttime,
+                time_end=pick_endtime,
+                phase=phase,
+                file_name=file_name,
+                min_score=min_score,
+            )
+            print(
+                f"{self.name}.run: {len(pick_ids)} picks selected "
+                f"(pick_method={pick_method!r}, "
+                f"window={pick_starttime!r}..{pick_endtime!r})"
+            )
+            picks_df = load_picks_by_ids(pick_ids, db_path)
+            from_store = True
 
-        if db_save:
+        if detector is not None:
+            windows = detector.detect(picks_df)
+
+        if windows is None:
+            catalog_df, assignments_df = self._associate(picks_df)
+        else:
+            catalog_df, assignments_df = self._associate_windowed(
+                picks_df, windows
+            )
+
+        if from_store and db_save:
             save_key = file_name if file_name is not None else "all"
             n_ev, n_as = save_associations(
                 catalog_df, assignments_df, db_path,
@@ -165,6 +227,52 @@ class BaseAssociator(ABC):
                 f"(file_name={save_key!r}, method={self.name!r})"
             )
 
+        return catalog_df, assignments_df
+
+    def _associate_windowed(self, picks_df, windows):
+        """Associate once per detection window; concatenate the results.
+
+        ``windows`` is a DataFrame with ``t_start`` / ``t_end`` columns (as
+        emitted by :meth:`EventDetector.detect`) or an iterable of
+        (start, end) pairs. Picks outside every window are never associated.
+        Each window's ``event_index`` is offset by a running counter so
+        indices stay unique across windows.
+        """
+        if not isinstance(windows, pd.DataFrame):
+            windows = pd.DataFrame(list(windows), columns=["t_start", "t_end"])
+        times = pd.to_datetime(picks_df["onset_time"])
+
+        catalogs, assigns = [], []
+        offset = 0
+        for _, w in windows.iterrows():
+            t_lo, t_hi = pd.Timestamp(w["t_start"]), pd.Timestamp(w["t_end"])
+            sub = picks_df[(times >= t_lo) & (times < t_hi)]
+            if sub.empty:
+                continue
+            cat, asg = self._associate(sub.reset_index(drop=True))
+            if len(cat):
+                cat = cat.copy()
+                asg = asg.copy()
+                cat["event_index"] = cat["event_index"] + offset
+                asg["event_index"] = asg["event_index"] + offset
+                offset = int(cat["event_index"].max()) + 1
+            catalogs.append(cat)
+            assigns.append(asg)
+
+        catalog_df = (
+            pd.concat(catalogs, ignore_index=True) if catalogs
+            else pd.DataFrame()
+        )
+        assignments_df = (
+            pd.concat(assigns, ignore_index=True) if assigns
+            else pd.DataFrame(
+                columns=["pick_index", "event_index", "gamma_score", "pick_id"]
+            )
+        )
+        print(
+            f"{self.name}: {len(windows)} window(s) -> {len(catalog_df)} "
+            f"events / {len(assignments_df)} assignments"
+        )
         return catalog_df, assignments_df
 
 
@@ -407,6 +515,9 @@ def run_association(
     config_flag="default",
     save=True,
     method="gamma",
+    picks=None,
+    detector=None,
+    windows=None,
     pick_method=None,
     pick_starttime=None,
     pick_endtime=None,
@@ -419,14 +530,19 @@ def run_association(
     one call.
 
     ``method`` selects the associator (see :data:`ASSOCIATORS`); ``config_flag``
-    and ``**config_overrides`` are forwarded to its ``from_preset``; the
-    remaining pick filters are forwarded to :meth:`BaseAssociator.run`.
+    and ``**config_overrides`` are forwarded to its ``from_preset``; ``picks``
+    (a picker DataFrame, associated directly with no database read/write),
+    ``detector`` / ``windows`` (detection-window gating) and the remaining
+    pick filters are forwarded to :meth:`BaseAssociator.run`.
 
     Returns ``(catalog_df, assignments_df)`` -- see :meth:`BaseAssociator.run`.
     """
     assoc = get_associator(method, config_flag, **config_overrides)
     return assoc.run(
         db_path,
+        picks=picks,
+        detector=detector,
+        windows=windows,
         pick_method=pick_method,
         pick_starttime=pick_starttime,
         pick_endtime=pick_endtime,
