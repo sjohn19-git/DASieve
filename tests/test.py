@@ -28,17 +28,20 @@ h5_files = [
 source_file = h5_files[0]
 survey_path = "/Users/sj201/Downloads/survey.csv"
 
+# Which fiber the data came from. Picks/events are keyed on (cable_id, the
+# patch's time window, method) -- so every file from this cable shares the
+# cable_id and is distinguished by its own time window.
+cable_id = "16BConst"
+
 patch = dc.spool(source_file)[0]
 survey = sieve.processing.load_survey(survey_path)
-dist = patch.coords.get_array("x")
-
 patch = sieve.processing.attach_geometry(patch, survey)
 
 
 
 patch = patch.select(distance=(1000, 3000))
 patch = sieve.processing.to_strain_rate(patch)
-patch = sieve.processing.cmd_remove(
+patch = sieve.processing.remove_cmod(
     patch, dim="distance", window=5000, method="median", plot=True
 )
 
@@ -60,7 +63,7 @@ df_trig = sieve.picking.trigger_picker(
     thr_off=1,
     plot=False,
     plot_channel=None,
-    file_name=source_file,
+    cable_id=cable_id,
 )
 
 # df_ar = sieve.picking.trigger_picker(
@@ -79,11 +82,11 @@ df_trig = sieve.picking.trigger_picker(
 #     plot=True,
 #     plot_channel=200,
 #     s_pick=False,
-#     file_name=source_file,
+#     cable_id=cable_id,
 # )
 
 df_pn = sieve.picking.phasenet_das_picker(
-    patch, min_prob=0.3, plot=True, plot_channel=280, file_name=source_file
+    patch, min_prob=0.3, plot=True, plot_channel=280, cable_id=cable_id
 )
 
 # EQTransformer (SeisBench) on the same patch, visualized with the shared
@@ -94,8 +97,7 @@ df_eqt = sieve.picking.seisbench_picker(
     pretrained="original",
     min_prob=0.3,
     plot=True,
-    pad_short=True,
-    file_name=source_file,
+    cable_id=cable_id,
 )
 
 
@@ -105,7 +107,7 @@ df = sieve.picking.seisbench_picker(
     model="phasenet",
     pretrained="original",
     plot=True,
-    file_name=source_file)
+    cable_id=cable_id)
 
 
 #%%
@@ -283,13 +285,13 @@ else:
                 lateral_stacking=False,
                 pws_power=2,
             )
-            patch = sieve.processing.cmd_remove(
+            patch = sieve.processing.remove_cmod(
                 patch, dim="distance", window=5000, method="median"
             )
 
             df_pn = sieve.picking.phasenet_das_picker(
                 patch, min_prob=0.3, plot=True, plot_channel=None,
-                file_name=source_file,
+                cable_id=cable_id,
             )
 
             save_path = os.path.join(results_dir, f"{stem}_phasenet.png")

@@ -24,9 +24,10 @@ Typical use::
     assoc = association.GammaAssociator.from_preset("default", dbscan_eps=3.0)
     assoc.update_config(**{"x(km)": (4258.0, 4263.0)})   # optional edits
     catalog_df, assignments_df = assoc.run(
-        pick_method="phasenetdas", file_name=".../event.h5", min_score=0.3,
-    )   # saves to events/assignments automatically (db_save=True),
-        # replacing previous results for the same (file_name, method)
+        pick_method="phasenetdas", cable_id="16BConst", min_score=0.3,
+    )   # saves to events/assignments automatically (db_save=True), replacing
+        # previous results for the same (cable_id, time window, method,
+        # pick_method)
 
 Picks can also be supplied directly as a DataFrame (e.g. straight from a
 picker, without going through the store). This path never touches the
@@ -35,11 +36,9 @@ database -- the events/assignments tables are only returned::
     df = sieve.picking.trigger_picker(patch, db_save=False)
     catalog_df, assignments_df = assoc.run(picks=df)
 
-or the one-call convenience wrapper::
+An associator can also be selected by name instead of importing the class::
 
-    catalog_df, assignments_df = association.run_association(
-        method="gamma", pick_method="phasenetdas", dbscan_eps=3.0,
-    )
+    assoc = association.get_associator("gamma", dbscan_eps=3.0)
 
 GaMMA itself is imported lazily inside :meth:`GammaAssociator._associate`, so
 importing ``dasieve`` does not require it to be installed.
@@ -48,6 +47,7 @@ importing ``dasieve`` does not require it to be installed.
 import copy
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -55,8 +55,51 @@ import pandas as pd
 from .store import (
     DEFAULT_DB_PATH,
     load_picks,
+    normalize_time_windows,
     save_associations,
 )
+
+
+# ---------------------------------------------------------------------------
+# Run-key helpers
+# ---------------------------------------------------------------------------
+def _run_tag(value, default=None):
+    """Collapse a scalar-or-iterable run-key part into a single label.
+
+    One run can pool several cables or pick methods; the stored key is then a
+    "+"-joined tag. The parts are always sorted, so the tag depends only on
+    *which* cables/methods went into the run, not the order they were listed
+    in -- ["b", "a"] and ["a", "b"] are the same run and replace each other.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, set)):
+        return "+".join(sorted(str(v) for v in value))
+    return value
+
+
+def _run_time_window(time_window, picks_df):
+    """The (time_start, time_end) a run is stored under.
+
+    A single explicit window is used as given. When several windows were
+    selected -- or none was named at all -- the run covers their whole span,
+    so the key is the min start / max end of the windows the picks came from.
+    Falls back to the picks' own onset times if the window columns are absent.
+    """
+    windows = normalize_time_windows(time_window)
+    if windows:
+        return min(w[0] for w in windows), max(w[1] for w in windows)
+    for start_col, end_col in (("time_start", "time_end"),
+                               ("onset_time", "onset_time")):
+        if start_col in picks_df.columns and len(picks_df):
+            starts = pd.to_datetime(picks_df[start_col], errors="coerce").dropna()
+            ends = pd.to_datetime(picks_df[end_col], errors="coerce").dropna()
+            if len(starts) and len(ends):
+                return starts.min().isoformat(), ends.max().isoformat()
+    raise ValueError(
+        "cannot determine the run's time window: pass time_window=(start, end) "
+        "to associator.run(), or use db_save=False"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +119,24 @@ class BaseAssociator(ABC):
     name: str = ""
 
     def __init__(self, config):
-        self.config = config
+        # copied, not aliased: update_config writes to self.config, so a
+        # caller-supplied dict must not be mutated behind their back
+        self.config = copy.deepcopy(config)
 
     @classmethod
     @abstractmethod
     def from_preset(cls, flag="default", **overrides):
         """Build an associator from a named preset, with optional overrides."""
+
+    @contextmanager
+    def _run_scope(self, picks_df):
+        """Per-run setup over the *whole* pick set, before any windowing.
+
+        Subclasses override this to derive run-wide state once -- e.g. GaMMA's
+        spatial search bounds, which must cover the full cable rather than
+        whichever channels happened to pick in the first detection window.
+        The base implementation does nothing."""
+        yield
 
     def update_config(self, **changes):
         """Edit this associator's config in place; returns ``self`` so calls
@@ -102,17 +157,16 @@ class BaseAssociator(ABC):
         db_path=DEFAULT_DB_PATH,
         *,
         picks=None,
-        detector=None,
         windows=None,
         pick_method=None,
-        pick_starttime=None,
-        pick_endtime=None,
         phase=None,
-        file_name=None,
+        cable_id=None,
+        time_window=None,
         min_score=None,
         db_save=True,
         plot=False,
         patch=None,
+        cmap="gray",
     ):
         """Associate picks -- from a DataFrame, or selected from the store.
 
@@ -126,14 +180,16 @@ class BaseAssociator(ABC):
         printed before association runs. When ``db_save`` is True (default)
         results are written to the events/assignments tables via
         :func:`dasieve.store.save_associations`, keyed on
-        (file_name, ``self.name``) -- re-running on the same data replaces the
-        previous results instead of duplicating them.
+        (``cable_id``, time window, ``self.name``, ``pick_method``) --
+        re-running the same associator over the same data replaces the previous
+        results, while a different pick set, cable, or window is kept as a
+        separate run.
 
         Either way, association can be gated by detection windows: pass
-        ``detector`` (an :class:`dasieve.detection.EventDetector`, run here on
-        the same picks) or precomputed ``windows``. Association then runs once
-        per window on the picks inside it; picks outside every window are
-        never associated. ``event_index`` stays unique across windows.
+        ``windows`` (e.g. from :meth:`dasieve.detection.EventDetector.detect`).
+        Association then runs once per window on the picks inside it; picks
+        outside every window are never associated. ``event_index`` stays
+        unique across windows.
 
         Parameters
         ----------
@@ -147,22 +203,31 @@ class BaseAssociator(ABC):
             :func:`dasieve.picking.phasenet_das_picker`. If there is no ``id``
             column, row positions are used, so ``assignments_df["pick_id"]``
             indexes back into ``picks`` rows.
-        detector : dasieve.detection.EventDetector, optional
-            Run on the picks to produce detection windows that gate the
-            association. Mutually exclusive with ``windows``.
         windows : pandas.DataFrame or iterable of (start, end), optional
-            Precomputed association windows (as returned by
-            :meth:`EventDetector.detect`, or any (t_start, t_end) pairs).
+            Precomputed association windows: a ``t_start``/``t_end`` DataFrame
+            as returned by :meth:`EventDetector.detect`, or an iterable of
+            (start, end) pairs. This is the only time knob on ``run()`` -- it
+            both restricts which picks are associated and segments them, since
+            each window is associated independently. To pre-filter picks by
+            their own onset time instead, select them with
+            :func:`dasieve.store.load_picks` and pass ``picks=``.
         pick_method : str or list of str, optional
             Which picker's picks to associate (the ``picks.method`` column,
             e.g. "phasenetdas") -- NOT the associator.
-        pick_starttime, pick_endtime : str or datetime, optional
-            Inclusive ``onset_time`` window.
-        phase, file_name, min_score : optional
+        phase, cable_id, time_window, min_score : optional
             Further filters, forwarded to
-            :func:`dasieve.store.select_pick_ids`. ``file_name`` doubles as the
-            save key: results are stored under (file_name, ``self.name``), with
-            file_name "all" when no file filter is set.
+            :func:`dasieve.store.select_pick_ids`. ``cable_id`` may name one
+            fiber or a list of them, and ``time_window`` one ``(start, end)``
+            run window or a list of them; picks from all of them are
+            associated together, as one run.
+
+            Both double as the save key: results are stored under
+            (cable_id, time window, ``self.name``, ``pick_method``). Several
+            cables collapse to a sorted "+"-joined tag ("all" when no cable
+            filter is set), so the order they were listed in does not affect
+            the key; several windows collapse to their overall span -- so the
+            saved window is the extent of the data the run covered, which is
+            not itself one of the stored pick windows.
         db_save : bool
             If True (default), save results to the events/assignments tables.
             Only applies when picks come from the store.
@@ -173,6 +238,8 @@ class BaseAssociator(ABC):
             cable at hand.
         patch : dascore.Patch, optional
             Only used when ``plot=True``, as the waterfall background.
+        cmap : str
+            Waterfall colormap for the plot background.
 
         Returns
         -------
@@ -180,13 +247,12 @@ class BaseAssociator(ABC):
             ``catalog_df`` -- the event catalog (time, x(km), y(km), z(km),
             gamma_score, sigma_time, magnitude, number_picks, ...).
             ``assignments_df`` -- ``pick_index``, ``event_index``,
-            ``gamma_score``, plus ``pick_id`` mapping each row back to
+            ``gamma_score`` (per-pick mixture likelihood density -- despite
+            the shared name, a different quantity from the event-level
+            ``gamma_score``), plus ``pick_id`` mapping each row back to
             ``picks.id`` in the store database (or to the row position in
             ``picks`` when a DataFrame was supplied without an ``id`` column).
         """
-        if detector is not None and windows is not None:
-            raise ValueError("pass either detector= or windows=, not both")
-
         if picks is not None:
             picks_df = picks.reset_index(drop=True)
             if "id" not in picks_df.columns:
@@ -200,38 +266,43 @@ class BaseAssociator(ABC):
             picks_df = load_picks(
                 db_path,
                 method=pick_method,
-                time_start=pick_starttime,
-                time_end=pick_endtime,
                 phase=phase,
-                file_name=file_name,
+                cable_id=cable_id,
+                time_window=time_window,
                 min_score=min_score,
             )
             print(
                 f"{self.name}.run: {len(picks_df)} picks selected "
-                f"(pick_method={pick_method!r}, "
-                f"window={pick_starttime!r}..{pick_endtime!r})"
+                f"(pick_method={pick_method!r}, cable_id={cable_id!r}, "
+                f"time_window={time_window!r})"
             )
             from_store = True
 
-        if detector is not None:
-            windows = detector.detect(picks_df)
-
-        if windows is None:
-            catalog_df, assignments_df = self._associate(picks_df)
-        else:
-            catalog_df, assignments_df = self._associate_windowed(
-                picks_df, windows
-            )
+        # run-wide setup (e.g. GaMMA's search bounds) is derived here, from
+        # the full pick set, so windowing cannot narrow it
+        with self._run_scope(picks_df):
+            if windows is None:
+                catalog_df, assignments_df = self._associate(picks_df)
+            else:
+                catalog_df, assignments_df = self._associate_windowed(
+                    picks_df, windows
+                )
 
         if from_store and db_save:
-            save_key = file_name if file_name is not None else "all"
+            cable_key = _run_tag(cable_id, default="all")
+            win_start, win_end = _run_time_window(time_window, picks_df)
+            # records which picker's picks were associated; a list of methods
+            # collapses to a single "+"-joined tag for the run key
+            pick_key = _run_tag(pick_method)
             n_ev, n_as = save_associations(
                 catalog_df, assignments_df, db_path,
-                file_name=save_key, method=self.name,
+                cable_id=cable_key, time_start=win_start, time_end=win_end,
+                method=self.name, pick_method=pick_key,
             )
             print(
                 f"{self.name}.run: saved {n_ev} events / {n_as} assignments "
-                f"(file_name={save_key!r}, method={self.name!r})"
+                f"(cable_id={cable_key!r}, time_window={win_start}..{win_end}, "
+                f"method={self.name!r}, pick_method={pick_key!r})"
             )
 
         if plot:
@@ -240,7 +311,7 @@ class BaseAssociator(ABC):
                 left_on="id", right_on="pick_id", how="left",
             )
             plot_association(picks_ev, catalog_df, patch=patch,
-                             title=self.name)
+                             title=self.name, cmap=cmap)
 
         return catalog_df, assignments_df
 
@@ -299,8 +370,15 @@ class GammaAssociator(BaseAssociator):
 
     Config presets hold GaMMA's non-geometric knobs only; the spatial search
     bounds ("x(km)", "y(km)", "z(km)", "bfgs_bounds") are derived from the
-    station geometry in :meth:`build_inputs` unless supplied explicitly via
-    :meth:`from_preset` / :meth:`update_config`."""
+    station geometry unless supplied explicitly via :meth:`from_preset` /
+    :meth:`update_config`.
+
+    Derivation happens once per :meth:`run`, over that run's whole pick set
+    (:meth:`_run_scope`), and the result is *not* written back into ``config``
+    -- so every detection window shares one box covering the cable, and a
+    later run on different data (another cable, another window set) derives
+    its own. The box actually used is readable afterwards as ``last_bounds``.
+    Bounds the user supplies are never overwritten."""
 
     name = "gamma"
 
@@ -321,6 +399,12 @@ class GammaAssociator(BaseAssociator):
         },
     }
 
+    #: Spatial bounds derived for the run in progress (see :meth:`_run_scope`);
+    #: None outside a run. ``last_bounds`` keeps the most recently derived set
+    #: for inspection -- the derivation itself never writes to ``config``.
+    _derived_bounds = None
+    last_bounds = None
+
     _OVERSAMPLE_BY_METHOD = {"BGMM": 4, "GMM": 1}
     # Padding (km) added around the station extent when auto-deriving the
     # spatial search bounds.
@@ -335,8 +419,9 @@ class GammaAssociator(BaseAssociator):
         ``overrides`` both selects a preset and edits it in one call, e.g.
         ``GammaAssociator.from_preset("default", dbscan_eps=10,
         vel={"p": 5.5, "s": 3.2})``. Spatial bounds ("x(km)", "y(km)",
-        "z(km)", "bfgs_bounds") may be passed here; otherwise they are
-        auto-derived from station geometry in :meth:`build_inputs`.
+        "z(km)", "bfgs_bounds") may be passed here, and are then used as given
+        on every run; otherwise they are auto-derived from station geometry
+        once per run (see :meth:`_run_scope`).
         ``oversample_factor`` is derived from ``method`` (BGMM -> 4, GMM -> 1)
         unless explicitly overridden.
         """
@@ -364,18 +449,99 @@ class GammaAssociator(BaseAssociator):
             )
         return self
 
+    def _station_frame(self, picks_df):
+        """One station per unique ``distance``, positioned in km.
+
+        Each unique ``distance`` is a station whose id is the distance value
+        (as string) and whose position is the pick's x/y/z geometry (meters ->
+        km; no lat/lon projection, the survey is already in local meters).
+        Picks without x/y/z cannot place a station and are dropped -- channels
+        outside the survey carry NaN geometry.
+
+        Shared by :meth:`build_inputs` and :meth:`_derive_bounds` so the
+        bounds are always derived from exactly the stations that will be
+        associated."""
+        geom_ok = picks_df[["x", "y", "z"]].notna().all(axis=1)
+        stations = (
+            picks_df[geom_ok]
+            .groupby("distance", as_index=False)
+            .first()[["distance", "x", "y", "z"]]
+            .sort_values("distance", ignore_index=True)
+        )
+        return pd.DataFrame(
+            {
+                "id": stations["distance"].astype(str),
+                "x(km)": stations["x"] / 1000.0,
+                "y(km)": stations["y"] / 1000.0,
+                "z(km)": stations["z"] / 1000.0,
+            }
+        )
+
+    def _derive_bounds(self, station_df):
+        """Spatial search bounds from the station extent, as a plain dict.
+
+        Only fills dims the *user* left unset. The guard reads ``self.config``,
+        which the derivation never writes to, so ``None`` unambiguously means
+        "not supplied" -- rather than "not computed yet" """
+        if not len(station_df):
+            return {}
+        out = {}
+        for dim in ("x(km)", "y(km)", "z(km)"):
+            if self.config.get(dim) is None:
+                out[dim] = (
+                    float(station_df[dim].min()) - self._BOUNDS_PAD_KM,
+                    float(station_df[dim].max()) + self._BOUNDS_PAD_KM,
+                )
+        if self.config.get("bfgs_bounds") is None:
+            x = out.get("x(km)", self.config.get("x(km)"))
+            y = out.get("y(km)", self.config.get("y(km)"))
+            z = out.get("z(km)", self.config.get("z(km)"))
+            if x is not None and y is not None and z is not None:
+                out["bfgs_bounds"] = (
+                    (x[0] - 1, x[1] + 1),
+                    (y[0] - 1, y[1] + 1),
+                    (0, z[1] + 1),
+                    (None, None),  # origin time
+                )
+        return out
+
+    def _effective_config(self, station_df):
+        """User config plus this run's derived bounds, as a fresh dict.
+
+        Prefers the bounds derived once per run by :meth:`_run_scope`; when
+        called outside a run (a direct :meth:`build_inputs` / :meth:`_associate`)
+        it falls back to deriving from the stations at hand."""
+        bounds = self._derived_bounds
+        if bounds is None:
+            bounds = self._derive_bounds(station_df)
+        return {**self.config, **bounds}
+
+    @contextmanager
+    def _run_scope(self, picks_df):
+        """Derive the spatial search bounds once, from the whole pick set.
+
+        Every window in the run then shares one box covering the whole cable,
+        instead of each window re-deriving from its own picks -- which let
+        whichever channels picked in the first window constrain all the later
+        ones, pinning their events to that box's edge. The bounds are dropped
+        on exit (kept only as ``last_bounds`` for inspection) so the next run
+        re-derives for its own data."""
+        self._derived_bounds = self._derive_bounds(self._station_frame(picks_df))
+        try:
+            yield
+        finally:
+            self.last_bounds = self._derived_bounds
+            self._derived_bounds = None
+
     def build_inputs(self, picks_df):
         """Build GaMMA's ``pick_df`` / ``station_df`` from store picks.
 
-        Each unique ``distance`` is treated as a station whose id is the
-        distance value (as string) and whose position is the pick's x/y/z
-        geometry (meters -> km; no lat/lon projection, the survey is already in
-        local meters). Stations with NaN geometry are dropped with a warning.
+        Each unique ``distance`` becomes a station (see
+        :meth:`_station_frame`); picks with NaN geometry are dropped.
 
-        If this associator's spatial bounds are unset, "x(km)", "y(km)",
-        "z(km)" are auto-filled from the station extent (padded by
-        ``_BOUNDS_PAD_KM``) and ``bfgs_bounds`` is derived from them. The
-        config is modified in place.
+        This does *not* touch the spatial search bounds -- those are resolved
+        separately by :meth:`_derive_bounds` / :meth:`_effective_config`, and
+        this associator's ``config`` is never modified.
 
         Parameters
         ----------
@@ -390,7 +556,6 @@ class GammaAssociator(BaseAssociator):
         expects. ``pick_df`` keeps the store pick ``id`` so assignments can be
         mapped back to the ``picks`` table.
         """
-        config = self.config
         picks_df = picks_df.reset_index(drop=True)
 
         # association needs station positions: keep only picks that carry x/y/z
@@ -429,44 +594,10 @@ class GammaAssociator(BaseAssociator):
                 stacklevel=2,
             )
 
-        # one station per unique distance, geometry from the first pick/station
-        stations = (
-            picks_df.groupby("distance", as_index=False)
-            .first()[["distance", "x", "y", "z"]]
-            .sort_values("distance", ignore_index=True)
-        )
-        nan_mask = stations[["x", "y", "z"]].isna().any(axis=1)
-        if nan_mask.any():
-            warnings.warn(
-                f"dropping {int(nan_mask.sum())} station(s) with NaN geometry "
-                "(channels absent from the survey?); their picks will not "
-                "associate.",
-                stacklevel=2,
-            )
-            stations = stations[~nan_mask].reset_index(drop=True)
-
-        station_df = pd.DataFrame(
-            {
-                "id": stations["distance"].astype(str),
-                "x(km)": stations["x"] / 1000.0,
-                "y(km)": stations["y"] / 1000.0,
-                "z(km)": stations["z"] / 1000.0,
-            }
-        )
-
-        if len(station_df):
-            for dim in ("x(km)", "y(km)", "z(km)"):
-                if config.get(dim) is None:
-                    lo = float(station_df[dim].min()) - self._BOUNDS_PAD_KM
-                    hi = float(station_df[dim].max()) + self._BOUNDS_PAD_KM
-                    config[dim] = (lo, hi)
-            if config.get("bfgs_bounds") is None:
-                config["bfgs_bounds"] = (
-                    (config["x(km)"][0] - 1, config["x(km)"][1] + 1),
-                    (config["y(km)"][0] - 1, config["y(km)"][1] + 1),
-                    (0, config["z(km)"][1] + 1),
-                    (None, None),  # origin time
-                )
+        # one station per unique distance. The search bounds are resolved
+        # separately (_derive_bounds / _effective_config), so nothing here
+        # writes to self.config.
+        station_df = self._station_frame(picks_df)
 
         return pick_df, station_df
 
@@ -474,9 +605,11 @@ class GammaAssociator(BaseAssociator):
         from gamma.utils import association  # lazy: GaMMA optional at import
 
         pick_df, station_df = self.build_inputs(picks_df)
+        # user config + the run's derived bounds; self.config stays untouched
+        config = self._effective_config(station_df)
 
         catalogs, assignments = association(
-            pick_df, station_df, self.config, method=self.config["method"]
+            pick_df, station_df, config, method=config["method"]
         )
 
         catalog_df = pd.DataFrame(catalogs)
@@ -492,6 +625,10 @@ class GammaAssociator(BaseAssociator):
         if not self.config.get("use_amplitude") and "magnitude" in catalog_df.columns:
             catalog_df["magnitude"] = np.nan
 
+        # GaMMA returns bare (pick_index, event_index, score) tuples. NOTE the
+        # third element is a per-pick mixture likelihood density (unbounded,
+        # unit-dependent) -- NOT the same quantity as the event-level
+        # "gamma_score", which is a soft pick count. Not a fit measure.
         assignments_df = pd.DataFrame(
             assignments, columns=["pick_index", "event_index", "gamma_score"]
         )
@@ -504,10 +641,18 @@ class GammaAssociator(BaseAssociator):
         return catalog_df, assignments_df
 
 
+
+
+
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_association(picks_ev, catalog_df, patch=None, title=""):
+def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
     """Event locations on the cable geometry | picks-on-data, event-colored.
 
     Left: the fiber in 3D with one star per event (one color per event).
@@ -531,6 +676,8 @@ def plot_association(picks_ev, catalog_df, patch=None, title=""):
         Event catalog with ``event_index``, ``x(km)``, ``y(km)``, ``z(km)``.
     patch : dascore.Patch, optional
         Waterfall background (and fiber geometry, if it carries x/y/z).
+    cmap : str
+        Waterfall colormap for the background.
     """
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator, ScalarFormatter
@@ -548,8 +695,8 @@ def plot_association(picks_ev, catalog_df, patch=None, title=""):
             geom = arrs
 
     event_ids = sorted(picks_ev["event_index"].dropna().unique())
-    cmap = plt.get_cmap("tab10")
-    ev_color = {ev: cmap(k % 10) for k, ev in enumerate(event_ids)}
+    ev_cmap = plt.get_cmap("tab10")
+    ev_color = {ev: ev_cmap(k % 10) for k, ev in enumerate(event_ids)}
 
     fig = plt.figure(figsize=(15, 6))
     ax3d = fig.add_subplot(1, 2, 1, projection="3d")
@@ -612,7 +759,7 @@ def plot_association(picks_ev, catalog_df, patch=None, title=""):
             [patch.dims.index("distance"), patch.dims.index("time")], [0, 1],
         )
         vmax = np.percentile(np.abs(data2d), 99)
-        ax_w.imshow(data2d, aspect="auto", cmap="gray",
+        ax_w.imshow(data2d, aspect="auto", cmap=cmap,
                     extent=(pt[0], pt[-1], p_dist[-1], p_dist[0]),
                     vmin=-vmax, vmax=vmax, interpolation="nearest")
     else:
@@ -645,71 +792,3 @@ def plot_association(picks_ev, catalog_df, patch=None, title=""):
     plt.tight_layout()
     plt.show()
     return fig
-
-
-# ---------------------------------------------------------------------------
-# Registry + convenience wrapper
-# ---------------------------------------------------------------------------
-#: method id -> associator class. New associators register here so callers can
-#: select one by name without importing the class directly.
-ASSOCIATORS = {GammaAssociator.name: GammaAssociator}
-
-
-def get_associator(method="gamma", flag="default", **overrides):
-    """Build an associator by name from a preset (see each class's PRESETS)."""
-    try:
-        cls = ASSOCIATORS[method]
-    except KeyError:
-        raise NotImplementedError(
-            f"associator method {method!r} is not implemented; "
-            f"available: {sorted(ASSOCIATORS)}"
-        )
-    return cls.from_preset(flag, **overrides)
-
-
-def run_association(
-    db_path=DEFAULT_DB_PATH,
-    *,
-    config_flag="default",
-    save=True,
-    method="gamma",
-    picks=None,
-    detector=None,
-    windows=None,
-    pick_method=None,
-    pick_starttime=None,
-    pick_endtime=None,
-    phase=None,
-    file_name=None,
-    min_score=None,
-    plot=False,
-    patch=None,
-    **config_overrides,
-):
-    """Build an associator, select picks, associate, and (optionally) save in
-    one call.
-
-    ``method`` selects the associator (see :data:`ASSOCIATORS`); ``config_flag``
-    and ``**config_overrides`` are forwarded to its ``from_preset``; ``picks``
-    (a picker DataFrame, associated directly with no database read/write),
-    ``detector`` / ``windows`` (detection-window gating) and the remaining
-    pick filters are forwarded to :meth:`BaseAssociator.run`.
-
-    Returns ``(catalog_df, assignments_df)`` -- see :meth:`BaseAssociator.run`.
-    """
-    assoc = get_associator(method, config_flag, **config_overrides)
-    return assoc.run(
-        db_path,
-        picks=picks,
-        detector=detector,
-        windows=windows,
-        pick_method=pick_method,
-        pick_starttime=pick_starttime,
-        pick_endtime=pick_endtime,
-        phase=phase,
-        file_name=file_name,
-        min_score=min_score,
-        db_save=save,
-        plot=plot,
-        patch=patch,
-    )

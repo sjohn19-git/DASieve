@@ -75,8 +75,8 @@ def compute_psd(
         UTC start time used when appending. Defaults to the patch start time.
     **plot_kwargs
         Forwarded to ``_plot_pdf`` when plot=True: fmin, fmax, vmin, vmax, ylim,
-        channel, dimension, t_start, t_end, p_min, p_max, bins. See ``_plot_pdf``
-        for defaults.
+        channel, dimension, t_start, t_end, p_min, p_max, bins, cmap. See
+        ``_plot_pdf`` for defaults.
 
     Returns
     -------
@@ -239,7 +239,7 @@ def plot_patch(
     patch: dc.Patch,
     vmin: float | None = None,
     vmax: float | None = None,
-    cmap: str = "gray",
+    cmap: str = "RdBu_r",
     channel_idx: int | None = None,
     space_dim: str = "distance",
     show: bool = False,
@@ -385,6 +385,7 @@ def _plot_pdf(
     ylim: tuple | None = None,
     channel: int | None = None,
     dimension: str = "time",
+    cmap: str = "jet",
 ) -> None:
     """
     Two-row plot: 2-D PSD-PDF (top) and median PSD line (bottom).
@@ -461,7 +462,7 @@ def _plot_pdf(
         f_edges,
         p_edges,
         H.T,
-        cmap="jet",
+        cmap=cmap,
         shading="auto",
         vmin=0 if vmin is None else vmin,
         vmax=1.0 if vmax is None else vmax,

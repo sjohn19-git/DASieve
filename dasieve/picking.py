@@ -58,19 +58,38 @@ def _auto_device():
     return "cpu"
 
 
-def _save_to_store(df, file_name, method, db_path=None):
+def time_window_from_patch(patch):
+    """Return the patch's ``(time_start, time_end)`` as ISO-8601 strings.
+
+    This is the time half of the store's run key: the span of data the picks
+    were produced from. Taken from the patch's time coordinate, so it reflects
+    the patch *as picked* -- if the patch was trimmed (``patch.select(time=...)``)
+    the window is the trimmed span, not the source file's full extent.
+    """
+    t = np.asarray(patch.coords.get_array("time"))
+    if t.size == 0:
+        raise ValueError("cannot derive a time window from a patch with no time samples")
+    return pd.Timestamp(t[0]).isoformat(), pd.Timestamp(t[-1]).isoformat()
+
+
+def _save_to_store(df, cable_id, method, patch, db_path=None):
     """Persist picks via :func:`dasieve.store.save_picks`. Imported lazily to
-    avoid a circular import (dasieve.store imports PICK_COLUMNS from this
-    module). Replaces existing rows for (file_name, method)."""
-    if file_name is None:
+    avoid a circular import (dasieve.store imports from this module). Replaces
+    existing rows for (cable_id, time_start, time_end, method); the time window
+    is derived from ``patch``."""
+    if cable_id is None:
         raise ValueError(
-            "db_save=True requires file_name (the source data file). "
-            "Pass file_name=... or db_save=False."
+            "db_save=True requires cable_id (which fiber the data came from). "
+            "Pass cable_id=... or db_save=False."
         )
     from .store import save_picks
 
+    time_start, time_end = time_window_from_patch(patch)
     kwargs = {} if db_path is None else {"db_path": db_path}
-    return save_picks(df, file_name=file_name, method=method, **kwargs)
+    return save_picks(
+        df, cable_id=cable_id, method=method,
+        time_start=time_start, time_end=time_end, **kwargs
+    )
 
 
 def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
@@ -121,7 +140,7 @@ def _pick_ar(
     return picks, None
 
 
-def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
+def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap="RdBu_r"):
     """Single plotting routine used for every method. Plots P/S picks when
     present, otherwise trigger onsets."""
     import matplotlib.pyplot as plt
@@ -149,7 +168,7 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off):
         data_dt,
         aspect="auto",
         extent=extent,
-        cmap="gray",
+        cmap=cmap,
         vmin=-vmax,
         vmax=vmax,
         interpolation="nearest",
@@ -239,8 +258,9 @@ def trigger_picker(
     l_s=0.2,
     plot=False,
     plot_channel=None,
+    cmap="RdBu_r",
     s_pick=True,
-    file_name=None,
+    cable_id=None,
     db_save=True,
     db_path=None,
 ):
@@ -253,7 +273,8 @@ def trigger_picker(
 
     db_save : if True (default), the picks are saved to the store via
         ``store.save_picks`` with this ``method`` as the store method,
-        replacing previous rows for (file_name, method). ``db_path`` overrides
+        replacing previous rows for (cable_id, time window, method) -- the
+        window is taken from the patch. ``db_path`` overrides
         the default store location. Pass db_save=False to only return the
         DataFrame.
     """
@@ -311,10 +332,10 @@ def trigger_picker(
     )
 
     if plot:
-        _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off)
+        _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, file_name, method, db_path=db_path)
+        _save_to_store(df, cable_id, method, patch, db_path=db_path)
 
     return df
 
@@ -468,7 +489,8 @@ def phasenet_das_picker(
     location=None,
     plot=False,
     plot_channel=None,
-    file_name=None,
+    cmap="RdBu_r",
+    cable_id=None,
     db_save=True,
     db_path=None,
 ):
@@ -490,7 +512,8 @@ def phasenet_das_picker(
     -------
     pandas.DataFrame with columns == PICK_COLUMNS. When ``db_save`` is True
     (default) the picks are also saved to the store with method
-    ``"phasenetdas"``, replacing previous rows for (file_name, method).
+    ``"phasenetdas"``, replacing previous rows for (cable_id, time window,
+    method); the window is taken from the patch.
     """
     import torch
     phases=("P", "S")
@@ -548,10 +571,10 @@ def phasenet_das_picker(
     if plot:
         n_ch = len(dist_vals)
         ch_idx = plot_channel if plot_channel is not None else n_ch // 2
-        _plot_picks(patch, df, ch_idx, None, None, None)
+        _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, file_name, "phasenetdas", db_path=db_path)
+        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
 
     return df
 
@@ -569,7 +592,8 @@ def phasenet_das_picker_disk(
     keep_files=False,
     plot=False,
     plot_channel=None,
-    file_name=None,
+    cmap="RdBu_r",
+    cable_id=None,
     db_save=True,
     db_path=None,
 ):
@@ -601,7 +625,7 @@ def phasenet_das_picker_disk(
     ``score`` (phase probability); cft_* and off_* columns are NaN. When
     ``db_save`` is True (default) the picks are also saved to the store with
     method ``"phasenetdas"``, replacing previous rows for
-    (file_name, method).
+    (cable_id, time window, method); the window is taken from the patch.
     """
     import torch
     import matplotlib
@@ -679,10 +703,10 @@ def phasenet_das_picker_disk(
     if plot:
         n_ch = len(patch.coords.get_array("distance"))
         ch_idx = plot_channel if plot_channel is not None else n_ch // 2
-        _plot_picks(patch, df, ch_idx, None, None, None)
+        _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, file_name, "phasenetdas", db_path=db_path)
+        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
 
     return df
 
@@ -799,53 +823,6 @@ def _model_window_seconds(base):
     return in_samples / model_fs
 
 
-def _pad_patch_time(patch, target_samples):
-    """Zero-pad a dascore patch along ``time`` up to ``target_samples`` samples,
-    extending the time coordinate at the native sample spacing. The original
-    data sits at the start; appended samples are zeros. Returns a new patch."""
-    time_vals = patch.coords.get_array("time")
-    nt = len(time_vals)
-    n_pad = int(target_samples) - nt
-    if n_pad <= 0:
-        return patch
-
-    dt = np.median(np.diff(time_vals))
-    extra_time = time_vals[-1] + dt * np.arange(1, n_pad + 1)
-    new_time = np.concatenate([time_vals, extra_time])
-
-    time_axis = patch.dims.index("time")
-    pad_width = [(0, 0)] * patch.data.ndim
-    pad_width[time_axis] = (0, n_pad)
-    new_data = np.pad(patch.data, pad_width, mode="constant", constant_values=0)
-
-    new_coords = {d: patch.coords.get_array(d) for d in patch.dims}
-    new_coords["time"] = new_time
-
-    # propagate non-dim coords (x/y/z geometry, any file metadata) so padding
-    # drops nothing: distance-attached pass through, time-attached numeric
-    # coords are NaN-padded to the new length
-    dim_map = getattr(patch.coords, "dim_map", {})
-    for name, dims in dim_map.items():
-        if name in patch.dims:
-            continue
-        arr = np.asarray(patch.coords.get_array(name))
-        dims = tuple(dims)
-        if dims == ("distance",):
-            new_coords[name] = ("distance", arr)
-        elif dims == ("time",) and np.issubdtype(arr.dtype, np.number):
-            new_coords[name] = (
-                "time",
-                np.concatenate([arr.astype(float), np.full(n_pad, np.nan)]),
-            )
-        else:
-            warnings.warn(
-                f"coord {name!r} (dims={dims}) cannot be carried through "
-                f"time padding and was dropped.",
-                stacklevel=2,
-            )
-    return patch.new(data=new_data, coords=new_coords, dims=patch.dims)
-
-
 def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr):
     """Map SeisBench ``DASPick`` objects (time=datetime64, channel=<distance
     coord value>, confidence, phase) into the shared PICK_COLUMNS schema.
@@ -928,11 +905,11 @@ def seisbench_picker(
     component_strategy="clone",
     min_prob=0.3,
     min_time_separation=1.0,
-    pad_short=True,
     device=None,
     plot=False,
     plot_channel=None,
-    file_name=None,
+    cmap="RdBu_r",
+    cable_id=None,
     db_save=True,
     db_path=None,
     method=None,
@@ -966,18 +943,12 @@ def seisbench_picker(
     min_prob : confidence threshold for picking (SeisBench ``thresholds``).
     min_time_separation : minimum spacing (s) between two same-phase picks on a
         channel (SeisBench ``min_time_separation``).
-    pad_short : if the patch is shorter than the model's fixed input window
-        (e.g. EQTransformer needs 60 s = 6000 samples @ 100 Hz), zero-pad it in
-        time up to one full window so the model can run. If ``False``, the patch
-        is left as-is and a warning is emitted (SeisBench will return no picks
-        when there is not a single complete window). Picks landing in the padded
-        region are unreliable; prefer feeding a patch that is already long
-        enough.
     device : "cuda" / "cpu" / "mps"; auto-detected (cuda if available else cpu).
-    plot, plot_channel : diagnostic plot via the shared ``_plot_picks``.
-    file_name, db_save, db_path : store persistence. When ``db_save`` is
+    plot, plot_channel, cmap : diagnostic plot via the shared ``_plot_picks``;
+        ``cmap`` sets the waterfall colormap (default "RdBu_r").
+    cable_id, db_save, db_path : store persistence. When ``db_save`` is
         True (default) the picks are saved, replacing previous rows for
-        (file_name, method).
+        (cable_id, time window, method); the window is taken from the patch.
     method : store method label. Defaults to ``"<model_key>_sb"`` (e.g.
         "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix keeps SeisBench
         results separate from the 2-D PhaseNet-DAS picks ("phasenetdas").
@@ -1014,23 +985,11 @@ def seisbench_picker(
         patch_fs = 1.0 / (np.median(np.diff(t_vals)) / np.timedelta64(1, "s"))
         patch_s = nt / patch_fs
         if patch_s < window_s:
-            need_samples = int(np.ceil(window_s * patch_fs))
-            if pad_short:
-                warnings.warn(
-                    f"{model_key}: patch is {patch_s:.2f}s but the model needs a "
-                    f"{window_s:.2f}s window; zero-padding to {window_s:.2f}s. "
-                    f"Picks in the padded region are unreliable.",
-                    stacklevel=2,
-                )
-                patch = _pad_patch_time(patch, need_samples)
-            else:
-                warnings.warn(
-                    f"{model_key}: patch is {patch_s:.2f}s, shorter than the "
-                    f"model's {window_s:.2f}s window; no complete window exists "
-                    f"so no picks will be returned. Pass a longer patch or "
-                    f"pad_short=True.",
-                    stacklevel=2,
-                    )
+            raise ValueError(
+                f"{model_key}: patch is {patch_s:.2f}s, shorter than the model's "
+                f"{window_s:.2f}s input window ({nt} samples at {patch_fs:.4g} Hz, "
+                f"needs {int(np.ceil(window_s * patch_fs))}). Pass a longer patch."
+            )
 
     da, dist_vals, time_vals, fs, t0_ns = _patch_to_xdas(patch)
     n_time = len(time_vals)
@@ -1065,10 +1024,10 @@ def seisbench_picker(
     if plot:
         n_ch = len(dist_vals)
         ch_idx = plot_channel if plot_channel is not None else n_ch // 2
-        _plot_picks(patch, df, ch_idx, None, None, None)
+        _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, file_name, method, db_path=db_path)
+        _save_to_store(df, cable_id, method, patch, db_path=db_path)
 
     return df
 

@@ -3,7 +3,7 @@
 Scans pick onset times with a sliding detection window and emits
 non-overlapping association windows wherever enough of the fiber picked at
 the same time. The windows gate association: only picks inside an emitted
-window are handed to an associator (see ``detector=`` / ``windows=`` on
+window are handed to an associator (see ``windows=`` on
 :meth:`dasieve.association.BaseAssociator.run`).
 
 Two trigger mechanisms, selected by ``method``:
@@ -37,14 +37,23 @@ Typical use::
     )
     windows = det.detect(picks=df_picks, plot=True, patch=patch)
 
-    # hand the windows (or the detector itself) to an associator:
+Bad or uninteresting channels are excluded with a boolean ``channel_mask``
+aligned to ``channels``. Masked-out channels are ignored entirely -- they
+neither count nor vote, and segments are split over the valid channels
+only (their picks are drawn grey when ``plot=True``)::
+
+    dist = patch.coords.get_array("distance")
+    det = detection.EventDetector(
+        ..., channels=dist, channel_mask=(dist > 1500) & (dist < 2800),
+    )
+
+    # hand the windows to an associator:
     catalog, assignments = assoc.run(picks=df_picks, windows=windows)
-    catalog, assignments = assoc.run(picks=df_picks, detector=det)
 
 ``detect`` can also pull picks straight from the store with the same filters
 as :func:`dasieve.store.select_pick_ids`::
 
-    windows = det.detect(pick_method="phasenetdas", file_name=".../ev.h5",
+    windows = det.detect(pick_method="phasenetdas", cable_id="16BConst",
                          min_score=0.3)
 """
 
@@ -89,6 +98,13 @@ class EventDetector:
         cover the whole fiber and ``seg_min_channels`` is validated against
         the smallest segment at construction; without it, segments are
         derived from the channels present in the picks at detect time.
+    channel_mask : array-like of bool, optional
+        Per-channel validity flag, same length and order as ``channels``
+        (which is then required). Picks on channels flagged False are
+        dropped before detection: they do not count toward
+        ``min_channels``, do not vote, and do not shape segment boundaries
+        -- segments are split over the valid channels only, so a stretch of
+        dead fiber cannot absorb a segment that could then never vote.
     """
 
     def __init__(
@@ -102,6 +118,7 @@ class EventDetector:
         seg_min_channels=2,
         min_votes=None,
         channels=None,
+        channel_mask=None,
     ):
         if method not in ("count", "vote"):
             raise ValueError(f"method must be 'count' or 'vote', got {method!r}")
@@ -148,11 +165,42 @@ class EventDetector:
         self.seg_min_channels = int(seg_min_channels)
         self.min_votes = None if min_votes is None else int(min_votes)
 
+        # valid-channel set from the mask; picks elsewhere are dropped at
+        # detect time and segments are built over these channels only
+        self._valid_channels = None
+        if channel_mask is not None:
+            if channels is None:
+                raise ValueError(
+                    "channel_mask requires channels (it is positional against "
+                    "them); pass channels=patch.coords.get_array('distance')"
+                )
+            mask = np.asarray(channel_mask)
+            chan = np.asarray(channels, float)
+            if mask.shape != chan.shape:
+                raise ValueError(
+                    f"channel_mask has length {mask.size}, but channels has "
+                    f"{chan.size}; they must align one-to-one"
+                )
+            if mask.dtype != bool:
+                mask = mask.astype(bool)
+            if not mask.any():
+                raise ValueError("channel_mask excludes every channel")
+            self._valid_channels = np.unique(chan[mask])
+            n_drop = chan.size - int(mask.sum())
+            if n_drop:
+                print(
+                    f"EventDetector: channel_mask keeps "
+                    f"{len(self._valid_channels)} of {chan.size} channels "
+                    f"({n_drop} excluded)"
+                )
+
         # segment layout from the full channel set, if provided (validated
         # here so an impossible seg_min_channels fails fast, not silently)
         self._segments = None
         if channels is not None:
-            self._segments = self._build_segments(np.asarray(channels, float))
+            base = (self._valid_channels if self._valid_channels is not None
+                    else np.asarray(channels, float))
+            self._segments = self._build_segments(base)
 
     # ------------------------------------------------------------------
     # segments
@@ -213,10 +261,12 @@ class EventDetector:
         pick_starttime=None,
         pick_endtime=None,
         phase=None,
-        file_name=None,
+        cable_id=None,
+        time_window=None,
         min_score=None,
         plot=False,
         patch=None,
+        cmap="RdBu_r",
     ):
         """Scan picks and emit non-overlapping association windows.
 
@@ -228,7 +278,8 @@ class EventDetector:
             with the remaining filters (same semantics as
             :func:`dasieve.store.select_pick_ids`; ``pick_method`` /
             ``pick_starttime`` / ``pick_endtime`` map to its ``method`` /
-            ``time_start`` / ``time_end``).
+            ``onset_start`` / ``onset_end``, and ``cable_id`` / ``time_window``
+            name the run the picks were stored under).
         plot : bool
             Draw the detector diagnostics: picks (over the patch waterfall if
             ``patch`` is given) with every emitted window shaded, and the
@@ -237,6 +288,8 @@ class EventDetector:
             brackets per segment (green = voted True).
         patch : dascore.Patch, optional
             Only used as the imshow background of the plot.
+        cmap : str
+            Waterfall colormap for the plot background.
 
         Returns
         -------
@@ -249,10 +302,11 @@ class EventDetector:
             picks = load_picks(
                 db_path,
                 method=pick_method,
-                time_start=pick_starttime,
-                time_end=pick_endtime,
+                onset_start=pick_starttime,
+                onset_end=pick_endtime,
                 phase=phase,
-                file_name=file_name,
+                cable_id=cable_id,
+                time_window=time_window,
                 min_score=min_score,
             )
             print(f"EventDetector.detect: {len(picks)} picks selected from store")
@@ -266,6 +320,25 @@ class EventDetector:
         ref = times.min()
         t_s = (times - ref).dt.total_seconds().to_numpy()
         dists = pd.to_numeric(picks["distance"], errors="coerce").to_numpy()
+
+        # drop picks on masked-out channels (kept aside only to grey them
+        # out in the plot, so an over-aggressive mask is visible)
+        t_ex = np.array([])
+        d_ex = np.array([])
+        if self._valid_channels is not None:
+            keep = np.isin(dists, self._valid_channels)
+            if not keep.any():
+                print(
+                    "EventDetector.detect: channel_mask excluded every pick "
+                    "-> no windows"
+                )
+                return empty
+            t_ex, d_ex = t_s[~keep], dists[~keep]
+            t_s, dists = t_s[keep], dists[keep]
+            print(
+                f"EventDetector.detect: channel_mask kept {int(keep.sum())} "
+                f"of {keep.size} picks"
+            )
 
         segments = self._segments
         if self.method == "vote":
@@ -301,17 +374,19 @@ class EventDetector:
         windows = pd.DataFrame(rows, columns=WINDOW_COLUMNS)
         print(
             f"EventDetector({self.method}): {len(windows)} window(s) from "
-            f"{len(picks)} picks over {duration:.2f} s"
+            f"{len(t_s)} picks over {duration:.2f} s"
         )
 
         if plot:
-            self._plot(t_s, dists, seg_idx, segments, windows, ref, patch)
+            self._plot(t_s, dists, seg_idx, segments, windows, ref, patch,
+                       cmap=cmap, t_excluded=t_ex, d_excluded=d_ex)
         return windows
 
     # ------------------------------------------------------------------
     # plotting
     # ------------------------------------------------------------------
-    def _plot(self, t_s, dists, seg_idx, segments, windows, ref, patch):
+    def _plot(self, t_s, dists, seg_idx, segments, windows, ref, patch,
+              cmap="RdBu_r", t_excluded=None, d_excluded=None):
         """Detector diagnostics: picks + emitted windows | metric trace."""
         import matplotlib.pyplot as plt
 
@@ -335,17 +410,21 @@ class EventDetector:
                 [0, 1],
             )
             vmax = np.percentile(np.abs(data2d), 99)
-            ax.imshow(data2d, aspect="auto", cmap="gray",
+            ax.imshow(data2d, aspect="auto", cmap=cmap,
                       extent=(pt[0], pt[-1], p_dist[-1], p_dist[0]),
                       vmin=-vmax, vmax=vmax, interpolation="nearest")
+        if t_excluded is not None and len(t_excluded):
+            ax.scatter(t_excluded, d_excluded, marker="|", s=25,
+                       linewidths=0.8, color="0.6",
+                       label="picks (masked out)", zorder=3)
         ax.scatter(t_s, dists, marker="|", s=25, linewidths=0.8,
                    color="darkblue", label="picks", zorder=3)
 
         for k, t0 in enumerate(w_starts):
             # look-ahead (association) window, light; detection window, darker
-            ax.axvspan(t0, t0 + self.look_ahead, color="gold", alpha=0.20,
+            ax.axvspan(t0, t0 + self.look_ahead, color="yellow", alpha=0.25,
                        zorder=2, label="association window" if k == 0 else None)
-            ax.axvspan(t0, t0 + self.window, color="orange", alpha=0.30,
+            ax.axvspan(t0, t0 + self.window, color="mediumseagreen", alpha=0.22,
                        zorder=2, label="detection window" if k == 0 else None)
 
         if self.method == "vote" and segments is not None:
@@ -393,7 +472,7 @@ class EventDetector:
         ax_m.axhline(thr, color="crimson", lw=1.0, ls="--",
                      label=f"threshold ({thr})")
         for t0 in w_starts:
-            ax_m.axvspan(t0, t0 + self.look_ahead, color="gold", alpha=0.20)
+            ax_m.axvspan(t0, t0 + self.look_ahead, color="yellow", alpha=0.25)
         ax_m.set_xlabel(f"Time (s) since {ref}")
         ax_m.set_ylabel(label)
         ax_m.legend(loc="upper right", fontsize=8)

@@ -66,13 +66,14 @@ def to_strain_rate(patch: dc.Patch) -> dc.Patch:
     return (patch * norm * 1e-9).set_units("m/m/s")
 
 
-def cmd_remove(
+def remove_cmod(
     patch: dc.Patch,
     dim: str = "distance",
     window: float | None = None,
     samples: bool = False,
     method: str = "median",
     plot: bool = False,
+    cmap: str = "RdBu_r",
 ) -> dc.Patch:
     """Remove common-mode noise by block-wise median subtraction along ``dim``.
 
@@ -89,6 +90,7 @@ def cmd_remove(
             time), or in samples if ``samples=True``. None uses the full dim.
         samples: If True, treat ``window`` as a sample/channel count.
         plot: If True, show the qc.plot_patch diagnostic of the result.
+        cmap: Waterfall colormap for the diagnostic plot.
 
     Returns:
         Patch with block-wise common mode removed (same shape and coords as input).
@@ -146,7 +148,7 @@ def cmd_remove(
     if plot:
         from .qc import plot_patch
 
-        plot_patch(result, show=True)
+        plot_patch(result, show=True, cmap=cmap)
 
     return result
 
@@ -159,6 +161,7 @@ def decimate(
     lateral_stacking: bool = True,
     pws_power: float = 2.0,
     plot_channel: int | None = None,
+    cmap: str = "RdBu_r",
 ) -> dc.Patch:
     """Decimate a DAS patch in time, space, or both.
 
@@ -172,6 +175,7 @@ def decimate(
         pws_power: Phase-weighted stack exponent used when lateral_stacking=True.
         plot_channel: Channel index to highlight in plots. Defaults to the middle
             channel when None.
+        cmap: Waterfall colormap.
     """
     if target_fs is None and target_dx is None:
         raise ValueError("At least one of target_fs or target_dx must be provided")
@@ -216,7 +220,7 @@ def decimate(
             )
 
     if plot:
-        _plot_decimation(stages, plot_channel)
+        _plot_decimation(stages, plot_channel, cmap=cmap)
 
     return result
 
@@ -308,6 +312,7 @@ def _lateral_stack(patch: dc.Patch, factor: int, pws_power: float = 2.0) -> dc.P
 def _plot_decimation(
     stages: list[tuple[dc.Patch, str]],
     channel: int | None = None,
+    cmap: str = "RdBu_r",
 ) -> None:
     """Waterfall + extracted trace for each decimation stage (n×2 grid)."""
     n = len(stages)
@@ -350,7 +355,7 @@ def _plot_decimation(
         im = ax_im.imshow(
             plot_data,
             aspect="auto",
-            cmap="gray",
+            cmap=cmap,
             vmin=-vmax,
             vmax=vmax,
             extent=[t_s[0], t_s[-1], float(dist[-1]), float(dist[0])],

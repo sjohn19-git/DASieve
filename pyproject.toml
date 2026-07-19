@@ -19,6 +19,8 @@ dependencies = [
     "pandas",
     "scipy",
     "matplotlib",
+    "scikit-image", # wavelet denoising (processing.wavelet_denoise)
+    "PyWavelets",   # required by skimage.restoration.denoise_wavelet
     "h5py",
     "obspy",        # STA/LTA + AR-AIC pickers
     "torch",        # backend for the deep-learning pickers
