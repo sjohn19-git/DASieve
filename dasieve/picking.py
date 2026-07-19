@@ -382,18 +382,15 @@ def _load_model(eqnet_dir, device, location, phases):
     else:
         raise ValueError(f"no pretrained model for location={location!r}")
 
-    cwd = os.getcwd()
-    try:
-        os.chdir(eqnet_dir)
-        checkpoint = torch.hub.load_state_dict_from_url(
-            model_url,
-            model_dir="./model_phasenet_das",
-            progress=True,
-            check_hash=True,
-            map_location="cpu",
-        )
-    finally:
-        os.chdir(cwd)
+    # absolute model_dir: same cache location EQNet's own predict.py uses
+    # (eqnet_dir/model_phasenet_das), without mutating the process cwd
+    checkpoint = torch.hub.load_state_dict_from_url(
+        model_url,
+        model_dir=os.path.join(eqnet_dir, "model_phasenet_das"),
+        progress=True,
+        check_hash=True,
+        map_location="cpu",
+    )
 
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)

@@ -1,5 +1,6 @@
 import csv
 import logging
+import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -189,10 +190,19 @@ def decimate(
 
     if target_fs is not None:
         current_fs = float(get_dim_sampling_rate(result, "time"))
-        factor = round(current_fs / target_fs)
-        if factor < 1:
+        if target_fs > current_fs:
             raise ValueError(
-                f"target_fs ({target_fs} Hz) exceeds current rate ({current_fs} Hz)"
+                f"target_fs ({target_fs} Hz) exceeds the current sampling "
+                f"rate ({current_fs:g} Hz); decimate can only reduce it"
+            )
+        factor = round(current_fs / target_fs)
+        achieved_fs = current_fs / factor
+        if abs(achieved_fs - target_fs) > 1e-6 * target_fs:
+            warnings.warn(
+                f"target_fs={target_fs} Hz does not divide the current rate "
+                f"({current_fs:g} Hz) evenly; decimating by {factor} to "
+                f"{achieved_fs:g} Hz instead",
+                stacklevel=2,
             )
         result = result.decimate(time=factor, filter_type="fir")
         if plot:
@@ -201,10 +211,19 @@ def decimate(
     if target_dx is not None:
         dist = result.coords.get_array("distance")
         current_dx = float(np.median(np.diff(dist)))
-        factor = round(target_dx / current_dx)
-        if factor < 1:
+        if target_dx < current_dx:
             raise ValueError(
-                f"target_dx ({target_dx} m) is smaller than current spacing ({current_dx} m)"
+                f"target_dx ({target_dx} m) is smaller than the current "
+                f"spacing ({current_dx:g} m); decimate can only coarsen it"
+            )
+        factor = round(target_dx / current_dx)
+        achieved_dx = current_dx * factor
+        if abs(achieved_dx - target_dx) > 1e-6 * target_dx:
+            warnings.warn(
+                f"target_dx={target_dx} m is not an integer multiple of the "
+                f"current spacing ({current_dx:g} m); decimating by {factor} "
+                f"to {achieved_dx:g} m instead",
+                stacklevel=2,
             )
         if lateral_stacking:
             result = _lateral_stack(result, factor, pws_power=pws_power)

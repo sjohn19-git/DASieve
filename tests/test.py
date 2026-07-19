@@ -31,7 +31,7 @@ survey_path = "/Users/sj201/Downloads/survey.csv"
 # Which fiber the data came from. Picks/events are keyed on (cable_id, the
 # patch's time window, method) -- so every file from this cable shares the
 # cable_id and is distinguished by its own time window.
-cable_id = "16BConst"
+cable_id = "16B"
 
 patch = dc.spool(source_file)[0]
 survey = sieve.processing.load_survey(survey_path)
@@ -52,7 +52,9 @@ patch = sieve.processing.decimate(
 
 #%%
 
-freqs, psd_db = sieve.qc.compute_psd(patch, plot=True, vmax=0.8, ylim=(-160, -132.5))
+freqs, psd_db = sieve.qc.compute_psd(
+    patch, cable_id=cable_id, plot=True, vmax=0.8, ylim=(-160, -132.5)
+)
 
 
 df_trig = sieve.picking.trigger_picker(

@@ -3,24 +3,30 @@ qc.py
 
 PSD QC product for DASieve.
 
-Computes per-channel Welch PSD from a DASCore patch and appends it to a
-persistent pandas pickle store. One row per (time, channel) pair.
+Computes per-channel Welch PSD from a DASCore patch and stores it in the
+DASieve SQLite database -- the same file that holds picks and events
+(default ``~/DASieve/dasieve.sqlite``; see :mod:`dasieve.store`). One
+``psd_runs`` row per processed patch (the frequency vector is stored once
+there), one ``psd`` row per channel holding that channel's PSD curve as a
+float32 blob. Appends are plain INSERTs, so the store scales to months of
+data without ever reloading what is already stored. Runs are keyed on
+(cable_id, time_start, time_end) -- the span of data the PSD was computed
+over, taken from the patch like the pickers do -- so re-processing the same
+span replaces the previous rows, like the picks table.
 
 Pipeline position: runs on the raw patch (before resample/decimate),
 corresponding to the "PSD QC Product — always runs" branch in the architecture.
 
-Store layout (psd_qc.pkl) — pandas DataFrame:
-    time   : pd.Timestamp   UTC start time of the processed file
-    ch     : int            channel index
-    freqs  : np.ndarray     frequency vector in Hz, shape (n_freq,)
-    psds   : np.ndarray     PSD in dB, shape (n_freq,)
+Reading the store back: :func:`dasieve.store.load_psd` returns one row per
+(time, channel) with ``freqs`` / ``psds`` arrays;
+:func:`dasieve.store.load_psd_runs` lists what is stored without reading
+any PSD blobs.
 
 Authors: Sebin John, 2025
 """
 
-import os
 import logging
-from pathlib import Path
+
 from dascore.utils.patch import get_dim_sampling_rate
 import numpy as np
 import pandas as pd
@@ -29,13 +35,11 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import dascore as dc
 
+from .picking import time_window_from_patch
+from .store import DEFAULT_DB_PATH, load_psd, load_psd_runs, save_psd
+
 
 log = logging.getLogger(__name__)
-
-
-# Default PSD store location — same directory as the picks store (dasieve.sqlite)
-# (~/DASieve). Single source of truth; callers override only when needed.
-DEFAULT_PSD_STORE = os.path.join(os.path.expanduser("~/DASieve"), "psd_qc.pkl")
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +51,10 @@ def compute_psd(
     patch: dc.Patch,
     append: bool = True,
     plot: bool = False,
-    store_path: str = DEFAULT_PSD_STORE,
-    timestamp=None,
+    db_path: str = DEFAULT_DB_PATH,
+    cable_id: str | None = None,
+    time_start=None,
+    time_end=None,
     **plot_kwargs,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -64,15 +70,26 @@ def compute_psd(
     patch : dc.Patch
         Raw DASCore patch. Dim order (time, distance) or (distance, time) both supported.
     append : bool
-        If True (default), append this PSD to the pickle store at ``store_path``
-        before plotting, so the current patch is included in the PDF. If False,
-        the store is left untouched (the current run is excluded from the plot).
+        If True (default), save this PSD to the store via
+        :func:`dasieve.store.save_psd` before plotting, so the current patch
+        is included in the PDF. If False, the store is left untouched (the
+        current run is excluded from the plot). Re-processing the same
+        (cable_id, time window) replaces the previously stored rows.
     plot : bool
         If True, render the PSD-PDF diagnostic from the store (see ``_plot_pdf``).
-    store_path : str
-        Pickle store path. Defaults to ``DEFAULT_PSD_STORE`` (~/DASieve/psd_qc.pkl).
-    timestamp : datetime-like, optional
-        UTC start time used when appending. Defaults to the patch start time.
+    db_path : str
+        DASieve database path (shared with picks/events). Defaults to
+        ``~/DASieve/dasieve.sqlite``.
+    cable_id : str
+        Which fiber the data came from (same meaning as in the picks store);
+        keys the stored run together with the time window and filters the
+        plot. Required when ``append`` is True, like ``db_save`` in the
+        pickers.
+    time_start, time_end : datetime-like, optional
+        The span of data the PSD covers, used as the run key when appending.
+        Defaults to the patch's own time window (see
+        :func:`dasieve.picking.time_window_from_patch`), so a trimmed patch
+        is stored as its own run rather than replacing the full file's.
     **plot_kwargs
         Forwarded to ``_plot_pdf`` when plot=True: fmin, fmax, vmin, vmax, ylim,
         channel, dimension, t_start, t_end, p_min, p_max, bins, cmap. See
@@ -85,6 +102,11 @@ def compute_psd(
     psd_db : np.ndarray, shape (n_freq, n_channel), float32
         PSD in dB for each channel.
     """
+    if append and cable_id is None:
+        raise ValueError(
+            "append=True requires cable_id (which fiber the data came from). "
+            "Pass cable_id=... or append=False."
+        )
     fs = get_dim_sampling_rate(patch, "time")
     data = np.array(patch.data, dtype=np.float32)
     if patch.dims.index("time") != 0:
@@ -114,120 +136,19 @@ def compute_psd(
     psd_db = (10.0 * np.log10(np.maximum(Pxx, 1e-30))).astype(np.float32)
 
     if append:
-        ts = patch.coords.min("time") if timestamp is None else timestamp
-        _append_to_store(ts, freqs, psd_db, store_path=store_path)
-
-    if plot:
-        _plot_pdf(store_path=store_path, **plot_kwargs)
-
-    return freqs, psd_db
-
-
-# ---------------------------------------------------------------------------
-# HDF5 store
-# ---------------------------------------------------------------------------
-
-
-def _append_to_store(
-    timestamp: np.datetime64,
-    frequencies: np.ndarray,
-    psd_db: np.ndarray,
-    store_path: str = DEFAULT_PSD_STORE,
-) -> None:
-    """
-    Append one PSD time step to the pandas pickle store.
-
-    Creates the store on first call. Subsequent calls extend the DataFrame.
-    Thread-unsafe — designed for single-writer pipeline use.
-
-    Parameters
-    ----------
-    timestamp : np.datetime64
-        UTC start time of the processed file.
-    frequencies : np.ndarray, shape (n_freq,)
-        Frequency vector in Hz.
-    psd_db : np.ndarray, shape (n_freq, n_channel), float32
-        PSD in dB to append.
-    store_path : str
-        Path to the pickle file (created if it does not exist). Defaults to
-        ``DEFAULT_PSD_STORE`` (~/DASieve/psd_qc.pkl).
-    """
-    store_path = str(store_path)
-    Path(store_path).parent.mkdir(parents=True, exist_ok=True)
-
-    n_freq, n_ch = psd_db.shape
-    t = pd.Timestamp(timestamp)
-
-    rows = pd.DataFrame(
-        {
-            "time": t,
-            "ch": np.arange(n_ch),
-            "freqs": [frequencies] * n_ch,
-            "psds": [psd_db[:, i] for i in range(n_ch)],
-        }
-    )
-
-    if Path(store_path).exists():
-        existing = pd.read_pickle(store_path)
-        dup = existing["time"] == t
-        if dup.any():
-            log.warning(f"Timestamp {timestamp} already in store — overwriting")
-            existing = existing[~dup]
-        df = pd.concat([existing, rows], ignore_index=True)
-    else:
-        df = rows
-        log.info(
-            f"Created PSD store: {store_path}  (n_channels={n_ch}, n_freq={n_freq})"
+        if time_start is None or time_end is None:
+            time_start, time_end = time_window_from_patch(patch)
+        save_psd(freqs, psd_db, db_path, cable_id=cable_id,
+                 time_start=time_start, time_end=time_end)
+        log.debug(
+            f"Saved PSD {time_start}..{time_end} (cable_id={cable_id!r}) "
+            f"to {db_path}"
         )
 
-    df.to_pickle(store_path)
-    log.debug(f"Appended t={timestamp} to {store_path}")
-    _trim_store(store_path, max_bytes=85 * 1024**3)
+    if plot:
+        _plot_pdf(db_path=db_path, cable_id=cable_id, **plot_kwargs)
 
-
-# ---------------------------------------------------------------------------
-# Store trimming
-# ---------------------------------------------------------------------------
-
-
-def _trim_store(store_path: str, max_bytes: int = 85 * 1024**3) -> None:
-    """
-    If the pickle store exceeds max_bytes, drop the oldest timestamps until it fits.
-
-    Parameters
-    ----------
-    store_path : str
-        Path to the pickle store.
-    max_bytes : int
-        Maximum allowed file size in bytes. Default 85 GB.
-    """
-    import os
-
-    size = os.path.getsize(store_path)
-    if size <= max_bytes:
-        return
-
-    log.warning(
-        f"Store size {size / 1024**3:.1f} GB exceeds limit "
-        f"{max_bytes / 1024**3:.0f} GB — trimming oldest timestamps"
-    )
-
-    df = pd.read_pickle(store_path)
-    unique_times = sorted(df["time"].unique())
-    n_times = len(unique_times)
-
-    fraction_to_keep = (max_bytes * 0.8) / size
-    keep_n = max(1, int(n_times * fraction_to_keep))
-    keep_times = set(unique_times[-keep_n:])
-
-    dropped = n_times - keep_n
-    df = df[df["time"].isin(keep_times)].reset_index(drop=True)
-    df.to_pickle(store_path)
-
-    new_size = os.path.getsize(store_path)
-    log.info(
-        f"Dropped {dropped} timestamps — store trimmed to {new_size / 1024**3:.1f} GB"
-    )
+    return freqs, psd_db
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +293,8 @@ def plot_patch(
 
 
 def _plot_pdf(
-    store_path: str = DEFAULT_PSD_STORE,
+    db_path: str = DEFAULT_DB_PATH,
+    cable_id: str | None = None,
     t_start=None,
     t_end=None,
     p_min: float | None = None,
@@ -392,10 +314,15 @@ def _plot_pdf(
 
     Parameters
     ----------
+    db_path : str
+        DASieve database holding the stored PSDs.
+    cable_id : str, optional
+        Restrict to one fiber's PSDs (None = all).
     dimension : {"distance", "channel", "time"}
         "distance" or "channel" — PDF built from all channels across the time
         range (existing behaviour). "time" — PDF built from a single channel
-        across all time steps between t_start and t_end.
+        across all time steps between t_start and t_end; only that channel's
+        rows are read from the store.
     ylim : tuple (ymin, ymax), optional
         Explicit y-axis limits in dB applied to both panels.
     channel : int, optional
@@ -404,29 +331,40 @@ def _plot_pdf(
         dimension="time" this selects which channel's PSDs to use (defaults
         to mid channel).
     """
-    df = pd.read_pickle(store_path)
-
-    if t_start is not None:
-        df = df[df["time"] >= pd.Timestamp(t_start)]
-    if t_end is not None:
-        df = df[df["time"] <= pd.Timestamp(t_end)]
+    if dimension in ("distance", "channel"):
+        # PDF uses every channel x every time step -> load everything in range
+        df = load_psd(db_path, cable_id=cable_id, t_start=t_start, t_end=t_end)
+        if df.empty:
+            raise ValueError(
+                f"no stored PSDs match (cable_id={cable_id!r}, "
+                f"{t_start!r}..{t_end!r}) in {db_path}"
+            )
+        n_channels = df["ch"].nunique()
+        ch = n_channels // 2 if channel is None else channel
+    else:  # "time": only the selected channel's rows are read
+        runs = load_psd_runs(db_path, cable_id=cable_id,
+                             t_start=t_start, t_end=t_end)
+        if runs.empty:
+            raise ValueError(
+                f"no stored PSD runs match (cable_id={cable_id!r}, "
+                f"{t_start!r}..{t_end!r}) in {db_path}"
+            )
+        ch = int(runs["n_ch"].max()) // 2 if channel is None else channel
+        df = load_psd(db_path, cable_id=cable_id, channel=ch,
+                      t_start=t_start, t_end=t_end)
+        if df.empty:
+            raise ValueError(f"channel {ch} has no stored PSDs in {db_path}")
 
     freqs = df["freqs"].iloc[0]
     freq_mask = (freqs >= fmin) & (freqs <= fmax)
     freqs_masked = freqs[freq_mask]
 
-    n_channels = df["ch"].nunique()
-    ch = n_channels // 2 if channel is None else channel
-
     if dimension in ("distance", "channel"):
-        # PDF uses every channel × every time step
         psd_matrix = np.vstack(df["psds"].to_numpy())  # (n_rows, n_freq)
         psd_masked = psd_matrix[:, freq_mask]
         pdf_title = f"PSD–PDF  |  all {n_channels} channels"
     else:  # "time"
-        # PDF uses only the selected channel across the time range
-        ch_rows = df[df["ch"] == ch]
-        psd_masked = np.vstack(ch_rows["psds"].to_numpy())[:, freq_mask]
+        psd_masked = np.vstack(df["psds"].to_numpy())[:, freq_mask]
         t_label = ""
         if t_start is not None or t_end is not None:
             t0_str = str(pd.Timestamp(t_start))[:19] if t_start is not None else "start"

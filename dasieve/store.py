@@ -1,4 +1,4 @@
-"""SQLite store for DAS picks and association results.
+"""SQLite store for DAS picks, association results, and PSD QC products.
 
 Data is identified by *which fiber* and *which span of time*, not by file
 path: ``cable_id`` (e.g. "16BConst") plus the ``(time_start, time_end)``
@@ -273,9 +273,13 @@ def _drop_associations_referencing(conn, cable_id, time_start, time_end, method)
 
 def _in_clause(column, value, clauses, params):
     """Append ``column = ?`` or ``column IN (?, ...)`` for a scalar or an
-    iterable of values."""
+    iterable of values. An empty iterable matches nothing (``IN ()`` would be
+    a SQLite syntax error)."""
     if isinstance(value, (list, tuple, set)):
         values = list(value)
+        if not values:
+            clauses.append("0")     # always false: no value can match
+            return
         placeholders = ", ".join(["?"] * len(values))
         clauses.append(f"{column} IN ({placeholders})")
         params.extend(values)
@@ -615,3 +619,241 @@ def save_associations(
             )
         conn.commit()
     return len(event_rows), len(assignment_rows)
+
+
+# ---------------------------------------------------------------------------
+# PSD QC store (psd_runs / psd tables)
+# ---------------------------------------------------------------------------
+# Blob dtypes are a fixed convention of the schema: decoding reads them back
+# with np.frombuffer, so they must never change without a schema migration.
+_PSD_FREQ_DTYPE = np.float64
+_PSD_DTYPE = np.float32
+
+
+def _init_psd_tables(db_path):
+    """Create the ``psd_runs`` / ``psd`` tables if missing.
+
+    One ``psd_runs`` row per processed patch, keyed like every other table on
+    (``cable_id``, ``time_start``, ``time_end``) -- the span of data the PSD
+    was computed over. The frequency vector is stored once there as a float64
+    blob, not per channel. One ``psd`` row per channel, holding that
+    channel's PSD curve (dB) as a float32 blob of length ``n_freq``, keyed
+    back to its run by ``run_id``.
+    """
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS psd_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cable_id TEXT NOT NULL,
+                time_start TEXT NOT NULL,
+                time_end TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                n_freq INTEGER NOT NULL,
+                n_ch INTEGER NOT NULL,
+                freqs BLOB NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS psd (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES psd_runs(id),
+                ch INTEGER NOT NULL,
+                psd BLOB NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_psd_runs_run "
+            "ON psd_runs (cable_id, time_start, time_end);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_psd_run ON psd (run_id, ch);"
+        )
+        conn.commit()
+
+
+def save_psd(
+    freqs, psd_db, db_path=DEFAULT_DB_PATH, *,
+    cable_id, time_start, time_end, replace=True,
+):
+    """Persist one patch's per-channel PSDs (e.g. from
+    :func:`dasieve.qc.compute_psd`).
+
+    Parameters
+    ----------
+    freqs : np.ndarray, shape (n_freq,)
+        Frequency vector in Hz (shared by every channel).
+    psd_db : np.ndarray, shape (n_freq, n_channel)
+        PSD in dB per channel; column index is the channel index.
+    cable_id : str
+        Which fiber the data came from (same meaning as in the picks table);
+        required, like everywhere else in the store.
+    time_start, time_end : datetime-like
+        The span of data the PSD was computed over, stored as ISO-8601.
+        Together with ``cable_id`` this is the run key, mirroring the picks
+        table -- so a PSD's averaging extent is always known, and a trimmed
+        patch is a separate run rather than silently replacing the full one.
+    replace : bool
+        If True (default), delete any previously stored run for this
+        (cable_id, time_start, time_end) first, so re-processing the same
+        span overwrites instead of duplicating.
+
+    Returns
+    -------
+    int : number of channel rows inserted.
+    """
+    if cable_id is None:
+        raise ValueError("save_psd requires cable_id")
+    time_start, time_end = _iso_or_none(time_start), _iso_or_none(time_end)
+    if time_start is None or time_end is None:
+        raise ValueError(
+            "save_psd requires a parseable time window (time_start/time_end)"
+        )
+    freqs = np.ascontiguousarray(freqs, dtype=_PSD_FREQ_DTYPE)
+    psd_db = np.ascontiguousarray(psd_db, dtype=_PSD_DTYPE)
+    if psd_db.ndim != 2 or psd_db.shape[0] != freqs.size:
+        raise ValueError(
+            f"psd_db must be (n_freq, n_channel) with n_freq == len(freqs); "
+            f"got psd_db {psd_db.shape} vs {freqs.size} frequencies"
+        )
+    n_freq, n_ch = psd_db.shape
+
+    _init_psd_tables(db_path)
+    created_at = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        if replace:
+            old = [
+                r[0] for r in conn.execute(
+                    "SELECT id FROM psd_runs WHERE cable_id = ? AND "
+                    "time_start = ? AND time_end = ?;",
+                    (cable_id, time_start, time_end),
+                ).fetchall()
+            ]
+            if old:
+                placeholders = ", ".join(["?"] * len(old))
+                conn.execute(
+                    f"DELETE FROM psd WHERE run_id IN ({placeholders});", old
+                )
+                conn.execute(
+                    f"DELETE FROM psd_runs WHERE id IN ({placeholders});", old
+                )
+        cur = conn.execute(
+            "INSERT INTO psd_runs (cable_id, time_start, time_end, created_at, "
+            "n_freq, n_ch, freqs) VALUES (?, ?, ?, ?, ?, ?, ?);",
+            (cable_id, time_start, time_end, created_at, n_freq, n_ch,
+             freqs.tobytes()),
+        )
+        run_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO psd (run_id, ch, psd) VALUES (?, ?, ?);",
+            [
+                (run_id, ch, np.ascontiguousarray(psd_db[:, ch]).tobytes())
+                for ch in range(n_ch)
+            ],
+        )
+        conn.commit()
+    return n_ch
+
+
+def load_psd_runs(db_path=DEFAULT_DB_PATH, *, cable_id=None, t_start=None,
+                  t_end=None):
+    """Inventory of stored PSD runs -- one row per
+    (cable_id, time_start, time_end).
+
+    Cheap: reads only run metadata (``n_freq``, ``n_ch``, ``created_at``),
+    no PSD blobs. ``time_start`` / ``time_end`` are parsed to datetime.
+    ``t_start`` / ``t_end`` range-filter on each run's start time.
+    """
+    _init_psd_tables(db_path)
+    clauses, params = [], []
+    if cable_id is not None:
+        _in_clause("cable_id", cable_id, clauses, params)
+    if t_start is not None:
+        clauses.append("time_start >= ?")
+        params.append(pd.Timestamp(t_start).isoformat())
+    if t_end is not None:
+        clauses.append("time_start <= ?")
+        params.append(pd.Timestamp(t_end).isoformat())
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _connect(db_path) as conn:
+        df = pd.read_sql_query(
+            f"SELECT cable_id, time_start, time_end, created_at, n_freq, n_ch "
+            f"FROM psd_runs{where} ORDER BY time_start;",
+            conn,
+            params=params,
+        )
+    for col in ("time_start", "time_end"):
+        # format="ISO8601": stored strings vary in fractional-second
+        # precision (isoformat drops ".000"), which a single inferred
+        # format would reject
+        df[col] = pd.to_datetime(df[col], format="ISO8601", errors="coerce")
+    return df
+
+
+def load_psd(db_path=DEFAULT_DB_PATH, *, cable_id=None, channel=None,
+             t_start=None, t_end=None):
+    """Load stored PSDs into a DataFrame: one row per (run, channel).
+
+    * ``time_start`` / ``time_end`` -- pd.Timestamp, the span of data the
+      run's PSD was computed over
+    * ``ch``    -- int channel index
+    * ``freqs`` -- np.ndarray (n_freq,), shared per run (decoded once)
+    * ``psds``  -- np.ndarray (n_freq,), PSD in dB
+
+    ``channel`` restricts the read to one channel (or a list of them) --
+    only those rows' blobs are fetched, so pulling one channel's history
+    stays cheap however many channels are stored. ``t_start`` / ``t_end``
+    range-filter on each run's start time.
+    """
+    _init_psd_tables(db_path)
+    clauses, params = [], []
+    if cable_id is not None:
+        _in_clause("r.cable_id", cable_id, clauses, params)
+    if channel is not None:
+        _in_clause("p.ch", channel, clauses, params)
+    if t_start is not None:
+        clauses.append("r.time_start >= ?")
+        params.append(pd.Timestamp(t_start).isoformat())
+    if t_end is not None:
+        clauses.append("r.time_start <= ?")
+        params.append(pd.Timestamp(t_end).isoformat())
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT r.time_start, r.time_end, p.ch, r.freqs, p.psd "
+            f"FROM psd p JOIN psd_runs r ON p.run_id = r.id{where} "
+            f"ORDER BY r.time_start, p.ch;",
+            params,
+        ).fetchall()
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["time_start", "time_end", "ch", "freqs", "psds"]
+        )
+
+    # decode each run's frequency blob once; every row of the run shares it
+    freq_memo = {}
+    starts, ends, chs, freqs_col, psds_col = [], [], [], [], []
+    for start_txt, end_txt, ch, freq_blob, psd_blob in rows:
+        f = freq_memo.get(freq_blob)
+        if f is None:
+            f = np.frombuffer(freq_blob, dtype=_PSD_FREQ_DTYPE)
+            freq_memo[freq_blob] = f
+        starts.append(start_txt)
+        ends.append(end_txt)
+        chs.append(ch)
+        freqs_col.append(f)
+        psds_col.append(np.frombuffer(psd_blob, dtype=_PSD_DTYPE))
+    return pd.DataFrame(
+        {
+            "time_start": pd.to_datetime(starts, format="ISO8601"),
+            "time_end": pd.to_datetime(ends, format="ISO8601"),
+            "ch": chs,
+            "freqs": freqs_col,
+            "psds": psds_col,
+        }
+    )
