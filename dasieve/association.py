@@ -244,7 +244,7 @@ class BaseAssociator(ABC):
         Returns
         -------
         (catalog_df, assignments_df)
-            ``catalog_df`` -- the event catalog (time, x(km), y(km), z(km),
+            ``catalog_df`` -- the event catalog (time, x, y, z in meters,
             gamma_score, sigma_time, magnitude, number_picks, ...).
             ``assignments_df`` -- ``pick_index``, ``event_index``,
             ``gamma_score`` (per-pick mixture likelihood density -- despite
@@ -621,6 +621,12 @@ class GammaAssociator(BaseAssociator):
                 "num_s_picks": "number_s_picks",
             }
         )
+        # GaMMA locates in km; everything else in dasieve (picks' x/y/z, the
+        # store, the plots) is in meters -- convert on the way out
+        for src, dst in (("x(km)", "x"), ("y(km)", "y"), ("z(km)", "z")):
+            if src in catalog_df.columns:
+                catalog_df[dst] = catalog_df.pop(src) * 1000.0
+
         # without amplitudes GaMMA fills magnitude with the 999 placeholder
         if not self.config.get("use_amplitude") and "magnitude" in catalog_df.columns:
             catalog_df["magnitude"] = np.nan
@@ -673,7 +679,7 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
         Picks with an ``event_index`` column (NaN = unassociated), i.e. the
         associator's picks joined to its assignments on pick id.
     catalog_df : pandas.DataFrame
-        Event catalog with ``event_index``, ``x(km)``, ``y(km)``, ``z(km)``.
+        Event catalog with ``event_index`` and ``x``, ``y``, ``z`` (meters).
     patch : dascore.Patch, optional
         Waterfall background (and fiber geometry, if it carries x/y/z).
     cmap : str
@@ -705,32 +711,32 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
     # --- left: fiber (if the patch has geometry) + event locations
     east_parts, north_parts, dep_parts = [], [], []
     if geom is not None:
-        f_north, f_east, f_dep = (g / 1000.0 for g in geom)
+        f_north, f_east, f_dep = geom
         ax3d.plot(f_east, f_north, f_dep, color="0.4", lw=1.5, label="fiber")
         east_parts.append(f_east)
         north_parts.append(f_north)
         dep_parts.append(f_dep)
     for ev in event_ids:
         row = catalog_df[catalog_df["event_index"] == ev].iloc[0]
-        ax3d.scatter(row["y(km)"], row["x(km)"], row["z(km)"], s=120,
+        ax3d.scatter(row["y"], row["x"], row["z"], s=120,
                      marker="*", color=ev_color[ev], edgecolor="k",
                      linewidths=0.5, label=f"event {int(ev)}")
     if len(catalog_df):
-        east_parts.append(catalog_df["y(km)"].to_numpy(float))
-        north_parts.append(catalog_df["x(km)"].to_numpy(float))
-        dep_parts.append(catalog_df["z(km)"].to_numpy(float))
+        east_parts.append(catalog_df["y"].to_numpy(float))
+        north_parts.append(catalog_df["x"].to_numpy(float))
+        dep_parts.append(catalog_df["z"].to_numpy(float))
 
     # per-cable extent with true spatial proportions
     if east_parts:
         lims = [
-            (np.nanmin(np.concatenate(v)) - 0.1,
-             np.nanmax(np.concatenate(v)) + 0.1)
+            (np.nanmin(np.concatenate(v)) - 100.0,
+             np.nanmax(np.concatenate(v)) + 100.0)
             for v in (east_parts, north_parts, dep_parts)
         ]
         ax3d.set_xlim(lims[0])
         ax3d.set_ylim(lims[1])
         ax3d.set_zlim(lims[2])
-        spans = [max(hi - lo, 1e-3) for lo, hi in lims]
+        spans = [max(hi - lo, 1.0) for lo, hi in lims]
         ax3d.set_box_aspect(spans)
         # tick count follows each axis's drawn length; full values (no offset)
         for axis, span in zip((ax3d.xaxis, ax3d.yaxis, ax3d.zaxis), spans):
@@ -741,9 +747,9 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
                 fmt.set_useOffset(False)
     ax3d.invert_zaxis()  # z is depth: shallowest on top
     ax3d.tick_params(labelsize=7, pad=0)
-    ax3d.set_xlabel("Easting (km)", fontsize=8, labelpad=4)
-    ax3d.set_ylabel("Northing (km)", fontsize=8, labelpad=4)
-    ax3d.set_zlabel("depth (km)", fontsize=8, labelpad=2)
+    ax3d.set_xlabel("Easting (m)", fontsize=8, labelpad=4)
+    ax3d.set_ylabel("Northing (m)", fontsize=8, labelpad=4)
+    ax3d.set_zlabel("depth (m)", fontsize=8, labelpad=2)
     ax3d.set_title(f"{title}: event locations" if title else "event locations",
                    fontsize=10)
     ax3d.legend(fontsize=7, loc="upper left")

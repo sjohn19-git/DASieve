@@ -16,6 +16,15 @@ Run cell-by-cell in VS Code / Jupyter, or top-to-bottom:
     python tests/compare_association.py
 """
 
+# Re-import dasieve on every cell run, so edits to the package take effect
+# without restarting the kernel (no-op outside IPython/Jupyter).
+try:
+    _ip = get_ipython()  # noqa: F821
+    _ip.run_line_magic("load_ext", "autoreload")
+    _ip.run_line_magic("autoreload", "2")
+except NameError:
+    pass
+
 import logging
 
 import numpy as np
@@ -36,7 +45,7 @@ survey_path = "/Users/sj201/Downloads/survey.csv"
 # Which fiber the data came from. The store keys picks on
 # (cable_id, the patch's time window, method), so several files from this
 # cable coexist as separate time windows under one cable_id.
-cable_id = "16BConst"
+cable_id = "16B"
 
 # %% ------------------------------------------------------------------------
 # 1. Load + preprocess
@@ -73,6 +82,15 @@ df_trig = sieve.picking.trigger_picker(
 logging.info("STA/LTA: %d trigger picks", len(df_trig))
 
 # %% ------------------------------------------------------------------------
+# 3b. Channel mask -- TEST ONLY: flag the last 30 channels as bad
+# ----------------------------------------------------------------------------
+dist = patch.coords.get_array("distance")
+channel_mask = np.ones(dist.size, dtype=bool)
+channel_mask[-100:] = False
+logging.info("channel_mask keeps %d / %d channels (last 30 excluded)",
+             int(channel_mask.sum()), channel_mask.size)
+
+# %% ------------------------------------------------------------------------
 # 4. Vote-method detection -> association windows
 #    (run on the dense PhaseNet-DAS picks so every fiber segment can vote)
 # ----------------------------------------------------------------------------
@@ -84,7 +102,9 @@ det = detection.EventDetector(
     n_segments=8,              # fiber split into 8 equal channel-count segments
     seg_min_channels=3,        # distinct channels for a segment to vote True
     min_votes=5,               # segments that must vote to trigger
-    channels=patch.coords.get_array("distance"),
+    channels=dist,
+    channel_mask=channel_mask,
+    
 )
 windows = det.detect(picks=df_pn, plot=True, patch=patch)
 print(windows)

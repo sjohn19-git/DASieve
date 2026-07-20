@@ -476,9 +476,9 @@ def _init_association_tables(db_path):
                 created_at TEXT NOT NULL,
                 event_index INTEGER,
                 time TEXT,
-                x_km REAL,
-                y_km REAL,
-                z_km REAL,
+                x REAL,
+                y REAL,
+                z REAL,
                 gamma_score REAL,
                 sigma_time REAL,
                 magnitude REAL,
@@ -556,9 +556,9 @@ def save_associations(
                 created_at,
                 _int_or_none(r.get("event_index")),
                 None if pd.isna(r.get("time")) else str(r.get("time")),
-                _float_or_none(r.get("x(km)")),
-                _float_or_none(r.get("y(km)")),
-                _float_or_none(r.get("z(km)")),
+                _float_or_none(r.get("x")),
+                _float_or_none(r.get("y")),
+                _float_or_none(r.get("z")),
                 _float_or_none(r.get("gamma_score")),
                 _float_or_none(r.get("sigma_time")),
                 _float_or_none(r.get("magnitude")),
@@ -573,7 +573,7 @@ def save_associations(
         if event_rows:
             conn.executemany(
                 "INSERT INTO events (cable_id, time_start, time_end, method, "
-                "pick_method, created_at, event_index, time, x_km, y_km, z_km, "
+                "pick_method, created_at, event_index, time, x, y, z, "
                 "gamma_score, sigma_time, magnitude, number_picks, "
                 "number_p_picks, number_s_picks) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",

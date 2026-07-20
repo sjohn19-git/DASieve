@@ -168,6 +168,7 @@ class EventDetector:
         # valid-channel set from the mask; picks elsewhere are dropped at
         # detect time and segments are built over these channels only
         self._valid_channels = None
+        self._masked_channels = None  # greyed out in the plot
         if channel_mask is not None:
             if channels is None:
                 raise ValueError(
@@ -186,6 +187,7 @@ class EventDetector:
             if not mask.any():
                 raise ValueError("channel_mask excludes every channel")
             self._valid_channels = np.unique(chan[mask])
+            self._masked_channels = np.unique(chan[~mask])
             n_drop = chan.size - int(mask.sum())
             if n_drop:
                 print(
@@ -413,6 +415,10 @@ class EventDetector:
             ax.imshow(data2d, aspect="auto", cmap=cmap,
                       extent=(pt[0], pt[-1], p_dist[-1], p_dist[0]),
                       vmin=-vmax, vmax=vmax, interpolation="nearest")
+        if self._masked_channels is not None:
+            ax.axhspan(self._masked_channels.min(), self._masked_channels.max(),
+                       color="0.3", alpha=0.16, zorder=2.5,
+                       label="masked channels")
         if t_excluded is not None and len(t_excluded):
             ax.scatter(t_excluded, d_excluded, marker="|", s=25,
                        linewidths=0.8, color="0.6",

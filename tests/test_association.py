@@ -83,7 +83,7 @@ logging.info("GaMMA: %d events, %d associated picks",
              len(catalog_df), len(assignments_df))
 
 if len(catalog_df):
-    _show = [c for c in ("event_index", "time", "x(km)", "y(km)", "z(km)",
+    _show = [c for c in ("event_index", "time", "x", "y", "z",
                          "gamma_score", "number_picks", "number_p_picks",
                          "number_s_picks") if c in catalog_df.columns]
     print(catalog_df[_show])
