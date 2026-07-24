@@ -48,13 +48,13 @@ only (their picks are drawn grey when ``plot=True``)::
     )
 
     # hand the windows to an associator:
-    catalog, assignments = assoc.run(picks=df_picks, windows=windows)
+    origins, associations = assoc.run(picks=df_picks, windows=windows)
 
 ``detect`` can also pull picks straight from the store with the same filters
 as :func:`dasieve.store.select_pick_ids`::
 
     windows = det.detect(pick_method="phasenetdas", cable_id="16BConst",
-                         min_score=0.3)
+                         min_probability=0.3)
 """
 
 import warnings
@@ -265,7 +265,7 @@ class EventDetector:
         phase=None,
         cable_id=None,
         time_window=None,
-        min_score=None,
+        min_probability=None,
         plot=False,
         patch=None,
         cmap="RdBu_r",
@@ -278,10 +278,9 @@ class EventDetector:
             Picks in the pickers' output schema (needs ``onset_time`` and
             ``distance``). When omitted, picks are selected from the store
             with the remaining filters (same semantics as
-            :func:`dasieve.store.select_pick_ids`; ``pick_method`` /
-            ``pick_starttime`` / ``pick_endtime`` map to its ``method`` /
-            ``onset_start`` / ``onset_end``, and ``cable_id`` / ``time_window``
-            name the run the picks were stored under).
+            :func:`dasieve.store.select_pick_ids`; ``pick_starttime`` /
+            ``pick_endtime`` map to its ``onset_start`` / ``onset_end``, and
+            ``cable_id`` / ``time_window`` name the file the picks came from).
         plot : bool
             Draw the detector diagnostics: picks (over the patch waterfall if
             ``patch`` is given) with every emitted window shaded, and the
@@ -303,13 +302,13 @@ class EventDetector:
         if picks is None:
             picks = load_picks(
                 db_path,
-                method=pick_method,
+                pick_method=pick_method,
                 onset_start=pick_starttime,
                 onset_end=pick_endtime,
                 phase=phase,
                 cable_id=cable_id,
                 time_window=time_window,
-                min_score=min_score,
+                min_probability=min_probability,
             )
             print(f"EventDetector.detect: {len(picks)} picks selected from store")
 

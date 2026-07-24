@@ -2,12 +2,20 @@
 
 Takes P/S picks from the SQLite store (:mod:`dasieve.store`), treats each
 DAS channel (unique ``distance``) as a station using the x/y/z geometry the
-pickers persisted, and clusters the picks into events. Results are written to
-two tables in the same store database (default ``~/DASieve/dasieve.sqlite``):
+pickers persisted, and clusters the picks into origins. Results are written
+to three tables in the same store database (default
+``~/DASieve/dasieve.sqlite``):
 
-* ``events``      -- one row per associated event (origin time, location, ...)
-* ``assignments`` -- one row per (event, pick) link, carrying the ``pick_id``
-                     back into the ``picks`` table.
+* ``origins``      -- one row per located hypocentre (origin time, location)
+* ``associations`` -- one row per (pick, origin) link, carrying the
+                      ``pick_id`` back into the ``picks`` table
+* ``events``       -- one per origin, pointing at it as the preferred origin
+
+Unlike the picks table, none of these carries a cable / time-window / method
+run key: an origin is identified by the picks it was built from, reached
+through ``associations``. Re-running an associator therefore replaces its
+previous results by superseding the associations on the picks it just ran
+over -- see :func:`dasieve.store.save_associations`.
 
 Each associator is a class; its config schema is its own (GaMMA's knobs are
 not shared by other associators), so config lives on the associator instance
@@ -23,22 +31,17 @@ Typical use::
     from dasieve import association
     assoc = association.GammaAssociator.from_preset("default", dbscan_eps=3.0)
     assoc.update_config(**{"x(km)": (4258.0, 4263.0)})   # optional edits
-    catalog_df, assignments_df = assoc.run(
-        pick_method="phasenetdas", cable_id="16BConst", min_score=0.3,
-    )   # saves to events/assignments automatically (db_save=True), replacing
-        # previous results for the same (cable_id, time window, method,
-        # pick_method)
+    origins_df, associations_df = assoc.run(
+        pick_method="phasenetdas", cable_id="16BConst", min_probability=0.3,
+    )   # saves origins/associations/events automatically (db_save=True),
+        # superseding this associator's previous results on these picks
 
 Picks can also be supplied directly as a DataFrame (e.g. straight from a
 picker, without going through the store). This path never touches the
-database -- the events/assignments tables are only returned::
+database -- the origins/associations tables are only returned::
 
     df = sieve.picking.trigger_picker(patch, db_save=False)
-    catalog_df, assignments_df = assoc.run(picks=df)
-
-An associator can also be selected by name instead of importing the class::
-
-    assoc = association.get_associator("gamma", dbscan_eps=3.0)
+    origins_df, associations_df = assoc.run(picks=df)
 
 GaMMA itself is imported lazily inside :meth:`GammaAssociator._associate`, so
 importing ``dasieve`` does not require it to be installed.
@@ -53,53 +56,12 @@ import numpy as np
 import pandas as pd
 
 from .store import (
+    ASSOCIATION_COLUMNS,
     DEFAULT_DB_PATH,
+    ORIGIN_COLUMNS,
     load_picks,
-    normalize_time_windows,
     save_associations,
 )
-
-
-# ---------------------------------------------------------------------------
-# Run-key helpers
-# ---------------------------------------------------------------------------
-def _run_tag(value, default=None):
-    """Collapse a scalar-or-iterable run-key part into a single label.
-
-    One run can pool several cables or pick methods; the stored key is then a
-    "+"-joined tag. The parts are always sorted, so the tag depends only on
-    *which* cables/methods went into the run, not the order they were listed
-    in -- ["b", "a"] and ["a", "b"] are the same run and replace each other.
-    """
-    if value is None:
-        return default
-    if isinstance(value, (list, tuple, set)):
-        return "+".join(sorted(str(v) for v in value))
-    return value
-
-
-def _run_time_window(time_window, picks_df):
-    """The (time_start, time_end) a run is stored under.
-
-    A single explicit window is used as given. When several windows were
-    selected -- or none was named at all -- the run covers their whole span,
-    so the key is the min start / max end of the windows the picks came from.
-    Falls back to the picks' own onset times if the window columns are absent.
-    """
-    windows = normalize_time_windows(time_window)
-    if windows:
-        return min(w[0] for w in windows), max(w[1] for w in windows)
-    for start_col, end_col in (("time_start", "time_end"),
-                               ("onset_time", "onset_time")):
-        if start_col in picks_df.columns and len(picks_df):
-            starts = pd.to_datetime(picks_df[start_col], errors="coerce").dropna()
-            ends = pd.to_datetime(picks_df[end_col], errors="coerce").dropna()
-            if len(starts) and len(ends):
-                return starts.min().isoformat(), ends.max().isoformat()
-    raise ValueError(
-        "cannot determine the run's time window: pass time_window=(start, end) "
-        "to associator.run(), or use db_save=False"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +74,7 @@ class BaseAssociator(ABC):
     results -- lives here; subclasses supply the associator-specific config
     schema (:meth:`from_preset`) and the actual clustering
     (:meth:`_associate`). ``name`` labels the associator and is written to the
-    ``method`` column of the events/assignments tables.
+    ``association_method`` column of the associations table.
     """
 
     #: Short associator id, e.g. "gamma"; set by each subclass.
@@ -146,10 +108,13 @@ class BaseAssociator(ABC):
 
     @abstractmethod
     def _associate(self, picks_df):
-        """Associate a store picks DataFrame into events.
+        """Associate a picks DataFrame into origins.
 
-        Returns ``(catalog_df, assignments_df)`` where ``assignments_df`` has
-        a ``pick_id`` column mapping each row back to ``picks.id``."""
+        Returns ``(origins_df, associations_df)`` with
+        :data:`dasieve.store.ORIGIN_COLUMNS` and
+        :data:`dasieve.store.ASSOCIATION_COLUMNS`; ``associations_df`` has a
+        ``pick_id`` column mapping each row back to ``picks.id`` and an
+        ``origin_index`` linking it to a row of ``origins_df``."""
         raise NotImplementedError
 
     def run(
@@ -162,7 +127,7 @@ class BaseAssociator(ABC):
         phase=None,
         cable_id=None,
         time_window=None,
-        min_score=None,
+        min_probability=None,
         db_save=True,
         plot=False,
         patch=None,
@@ -172,23 +137,23 @@ class BaseAssociator(ABC):
 
         When ``picks`` is given, that DataFrame is associated directly: the
         database is not touched at all (no selection, no save; the pick
-        filters and ``db_save`` are ignored) and the events/assignments
+        filters and ``db_save`` are ignored) and the origins/associations
         tables are only returned.
 
         Otherwise selection is delegated to
         :func:`dasieve.store.select_pick_ids`; the number of selected picks is
         printed before association runs. When ``db_save`` is True (default)
-        results are written to the events/assignments tables via
-        :func:`dasieve.store.save_associations`, keyed on
-        (``cable_id``, time window, ``self.name``, ``pick_method``) --
-        re-running the same associator over the same data replaces the previous
-        results, while a different pick set, cable, or window is kept as a
-        separate run.
+        results are written via :func:`dasieve.store.save_associations`, which
+        first supersedes this associator's existing associations on the
+        selected picks and cascades that to their origins and events. So
+        re-running the same associator over the same picks leaves one set of
+        origins, while another associator's results on those picks are left
+        alone.
 
         Either way, association can be gated by detection windows: pass
         ``windows`` (e.g. from :meth:`dasieve.detection.EventDetector.detect`).
         Association then runs once per window on the picks inside it; picks
-        outside every window are never associated. ``event_index`` stays
+        outside every window are never associated. ``origin_index`` stays
         unique across windows.
 
         Parameters
@@ -196,12 +161,11 @@ class BaseAssociator(ABC):
         db_path : str
             Catalog database holding the picks.
         picks : pandas.DataFrame, optional
-            Picks to associate directly, in the pickers' output schema (must
-            include ``onset_time``, ``score``, ``phase``, ``distance``,
-            ``x``, ``y``, ``z``), e.g. the DataFrame returned by
-            :func:`dasieve.picking.trigger_picker` or
+            Picks to associate directly, in the pickers' output schema
+            (:data:`dasieve.picking.PICK_COLUMNS`), e.g. the DataFrame
+            returned by :func:`dasieve.picking.trigger_picker` or
             :func:`dasieve.picking.phasenet_das_picker`. If there is no ``id``
-            column, row positions are used, so ``assignments_df["pick_id"]``
+            column, row positions are used, so ``associations_df["pick_id"]``
             indexes back into ``picks`` rows.
         windows : pandas.DataFrame or iterable of (start, end), optional
             Precomputed association windows: a ``t_start``/``t_end`` DataFrame
@@ -212,29 +176,25 @@ class BaseAssociator(ABC):
             their own onset time instead, select them with
             :func:`dasieve.store.load_picks` and pass ``picks=``.
         pick_method : str or list of str, optional
-            Which picker's picks to associate (the ``picks.method`` column,
-            e.g. "phasenetdas") -- NOT the associator.
-        phase, cable_id, time_window, min_score : optional
+            Which picker's picks to associate (the ``picks.pick_method``
+            column, e.g. "phasenetdas") -- NOT the associator.
+        phase, cable_id, time_window, min_probability : optional
             Further filters, forwarded to
             :func:`dasieve.store.select_pick_ids`. ``cable_id`` may name one
-            fiber or a list of them, and ``time_window`` one ``(start, end)``
-            run window or a list of them; picks from all of them are
-            associated together, as one run.
+            fiber or a list of them, and ``time_window`` one
+            ``(file_starttime, file_endtime)`` window or a list of them; picks
+            from all of them are associated together, as one run.
 
-            Both double as the save key: results are stored under
-            (cable_id, time window, ``self.name``, ``pick_method``). Several
-            cables collapse to a sorted "+"-joined tag ("all" when no cable
-            filter is set), so the order they were listed in does not affect
-            the key; several windows collapse to their overall span -- so the
-            saved window is the extent of the data the run covered, which is
-            not itself one of the stored pick windows.
+            The selection also scopes the replace: everything this associator
+            previously wrote on the selected picks is superseded, whether or
+            not this run re-associates each one.
         db_save : bool
-            If True (default), save results to the events/assignments tables.
-            Only applies when picks come from the store.
+            If True (default), save results to the store. Only applies when
+            picks come from the store.
         plot : bool
-            Draw :func:`plot_association` for the results: event locations on
+            Draw :func:`plot_association` for the results: origin locations on
             the cable geometry next to the picks-on-data view colored by
-            event. Geometry comes from the picks' x/y/z, so it adapts to the
+            origin. Geometry comes from the picks' x/y/z, so it adapts to the
             cable at hand.
         patch : dascore.Patch, optional
             Only used when ``plot=True``, as the waterfall background.
@@ -243,15 +203,14 @@ class BaseAssociator(ABC):
 
         Returns
         -------
-        (catalog_df, assignments_df)
-            ``catalog_df`` -- the event catalog (time, x, y, z in meters,
-            gamma_score, sigma_time, magnitude, number_picks, ...).
-            ``assignments_df`` -- ``pick_index``, ``event_index``,
-            ``gamma_score`` (per-pick mixture likelihood density -- despite
-            the shared name, a different quantity from the event-level
-            ``gamma_score``), plus ``pick_id`` mapping each row back to
-            ``picks.id`` in the store database (or to the row position in
-            ``picks`` when a DataFrame was supplied without an ``id`` column).
+        (origins_df, associations_df)
+            ``origins_df`` -- :data:`dasieve.store.ORIGIN_COLUMNS`:
+            ``origin_index``, ``origin_method``, ``origin_time``, ``x``,
+            ``y``, ``z`` (meters), ``number_picks``.
+            ``associations_df`` -- :data:`dasieve.store.ASSOCIATION_COLUMNS`:
+            ``pick_id`` (back into ``picks.id``, or the row position in
+            ``picks`` when a DataFrame was supplied without an ``id``),
+            ``origin_index``, ``association_method``, ``probability``.
         """
         if picks is not None:
             picks_df = picks.reset_index(drop=True)
@@ -265,11 +224,11 @@ class BaseAssociator(ABC):
         else:
             picks_df = load_picks(
                 db_path,
-                method=pick_method,
+                pick_method=pick_method,
                 phase=phase,
                 cable_id=cable_id,
                 time_window=time_window,
-                min_score=min_score,
+                min_probability=min_probability,
             )
             print(
                 f"{self.name}.run: {len(picks_df)} picks selected "
@@ -282,38 +241,35 @@ class BaseAssociator(ABC):
         # the full pick set, so windowing cannot narrow it
         with self._run_scope(picks_df):
             if windows is None:
-                catalog_df, assignments_df = self._associate(picks_df)
+                origins_df, associations_df = self._associate(picks_df)
             else:
-                catalog_df, assignments_df = self._associate_windowed(
+                origins_df, associations_df = self._associate_windowed(
                     picks_df, windows
                 )
 
         if from_store and db_save:
-            cable_key = _run_tag(cable_id, default="all")
-            win_start, win_end = _run_time_window(time_window, picks_df)
-            # records which picker's picks were associated; a list of methods
-            # collapses to a single "+"-joined tag for the run key
-            pick_key = _run_tag(pick_method)
-            n_ev, n_as = save_associations(
-                catalog_df, assignments_df, db_path,
-                cable_id=cable_key, time_start=win_start, time_end=win_end,
-                method=self.name, pick_method=pick_key,
+            # the replace scope is the whole selection, not just the picks
+            # that ended up associated: a rerun associating fewer picks must
+            # still supersede what the previous run built from them
+            n_or, n_as, n_ev = save_associations(
+                origins_df, associations_df, db_path,
+                association_method=self.name,
+                pick_ids=picks_df["id"].tolist(),
             )
             print(
-                f"{self.name}.run: saved {n_ev} events / {n_as} assignments "
-                f"(cable_id={cable_key!r}, time_window={win_start}..{win_end}, "
-                f"method={self.name!r}, pick_method={pick_key!r})"
+                f"{self.name}.run: saved {n_or} origins / {n_as} associations "
+                f"/ {n_ev} events (association_method={self.name!r})"
             )
 
         if plot:
             picks_ev = picks_df.merge(
-                assignments_df[["pick_id", "event_index"]],
+                associations_df[["pick_id", "origin_index"]],
                 left_on="id", right_on="pick_id", how="left",
             )
-            plot_association(picks_ev, catalog_df, patch=patch,
+            plot_association(picks_ev, origins_df, patch=patch,
                              title=self.name, cmap=cmap)
 
-        return catalog_df, assignments_df
+        return origins_df, associations_df
 
     def _associate_windowed(self, picks_df, windows):
         """Associate once per detection window; concatenate the results.
@@ -321,45 +277,43 @@ class BaseAssociator(ABC):
         ``windows`` is a DataFrame with ``t_start`` / ``t_end`` columns (as
         emitted by :meth:`EventDetector.detect`) or an iterable of
         (start, end) pairs. Picks outside every window are never associated.
-        Each window's ``event_index`` is offset by a running counter so
+        Each window's ``origin_index`` is offset by a running counter so
         indices stay unique across windows.
         """
         if not isinstance(windows, pd.DataFrame):
             windows = pd.DataFrame(list(windows), columns=["t_start", "t_end"])
         times = pd.to_datetime(picks_df["onset_time"])
 
-        catalogs, assigns = [], []
+        origins, assocs = [], []
         offset = 0
         for _, w in windows.iterrows():
             t_lo, t_hi = pd.Timestamp(w["t_start"]), pd.Timestamp(w["t_end"])
             sub = picks_df[(times >= t_lo) & (times < t_hi)]
             if sub.empty:
                 continue
-            cat, asg = self._associate(sub.reset_index(drop=True))
-            if len(cat):
-                cat = cat.copy()
-                asg = asg.copy()
-                cat["event_index"] = cat["event_index"] + offset
-                asg["event_index"] = asg["event_index"] + offset
-                offset = int(cat["event_index"].max()) + 1
-            catalogs.append(cat)
-            assigns.append(asg)
+            org, asc = self._associate(sub.reset_index(drop=True))
+            if len(org):
+                org = org.copy()
+                asc = asc.copy()
+                org["origin_index"] = org["origin_index"] + offset
+                asc["origin_index"] = asc["origin_index"] + offset
+                offset = int(org["origin_index"].max()) + 1
+            origins.append(org)
+            assocs.append(asc)
 
-        catalog_df = (
-            pd.concat(catalogs, ignore_index=True) if catalogs
-            else pd.DataFrame()
+        origins_df = (
+            pd.concat(origins, ignore_index=True) if origins
+            else pd.DataFrame(columns=ORIGIN_COLUMNS)
         )
-        assignments_df = (
-            pd.concat(assigns, ignore_index=True) if assigns
-            else pd.DataFrame(
-                columns=["pick_index", "event_index", "gamma_score", "pick_id"]
-            )
+        associations_df = (
+            pd.concat(assocs, ignore_index=True) if assocs
+            else pd.DataFrame(columns=ASSOCIATION_COLUMNS)
         )
         print(
-            f"{self.name}: {len(windows)} window(s) -> {len(catalog_df)} "
-            f"events / {len(assignments_df)} assignments"
+            f"{self.name}: {len(windows)} window(s) -> {len(origins_df)} "
+            f"origins / {len(associations_df)} associations"
         )
-        return catalog_df, assignments_df
+        return origins_df, associations_df
 
 
 # ---------------------------------------------------------------------------
@@ -547,14 +501,14 @@ class GammaAssociator(BaseAssociator):
         ----------
         picks_df : pandas.DataFrame
             Picks as returned by :func:`dasieve.store.load_picks_by_ids`
-            (must include ``id``, ``onset_time``, ``score``, ``phase``,
-            ``distance``, ``x``, ``y``, ``z``).
+            (must include ``id``, ``onset_time``, ``probability``,
+            ``phase``, ``distance``, ``x``, ``y``, ``z``).
 
         Returns
         -------
         (pick_df, station_df) : the two DataFrames GaMMA's ``association``
-        expects. ``pick_df`` keeps the store pick ``id`` so assignments can be
-        mapped back to the ``picks`` table.
+        expects. ``pick_df`` keeps the store pick ``id`` so associations can
+        be mapped back to the ``picks`` table.
         """
         picks_df = picks_df.reset_index(drop=True)
 
@@ -573,14 +527,14 @@ class GammaAssociator(BaseAssociator):
             {
                 "id": picks_df["distance"].astype(str),
                 "timestamp": pd.to_datetime(picks_df["onset_time"]),
-                "prob": pd.to_numeric(picks_df["score"], errors="coerce").fillna(
-                    self._DEFAULT_PROB
-                ),
+                "prob": pd.to_numeric(
+                    picks_df["probability"], errors="coerce"
+                ).fillna(self._DEFAULT_PROB),
                 "type": picks_df["phase"].astype(str).str.lower(),
             }
         )
         # keep the DB pick id (not passed to GaMMA's columns, but rides along
-        # so assignments' pick_index can be mapped back to the store)
+        # so associations' pick_index can be mapped back to the store)
         pick_df["pick_id"] = (
             picks_df["id"].to_numpy() if "id" in picks_df else np.arange(len(picks_df))
         )
@@ -613,13 +567,13 @@ class GammaAssociator(BaseAssociator):
         )
 
         catalog_df = pd.DataFrame(catalogs)
+        if not len(catalog_df):
+            return (pd.DataFrame(columns=ORIGIN_COLUMNS),
+                    pd.DataFrame(columns=ASSOCIATION_COLUMNS))
+
         # normalize across GaMMA versions: newer releases emit num_* names
         catalog_df = catalog_df.rename(
-            columns={
-                "num_picks": "number_picks",
-                "num_p_picks": "number_p_picks",
-                "num_s_picks": "number_s_picks",
-            }
+            columns={"num_picks": "number_picks", "event_index": "origin_index"}
         )
         # GaMMA locates in km; everything else in dasieve (picks' x/y/z, the
         # store, the plots) is in meters -- convert on the way out
@@ -627,24 +581,47 @@ class GammaAssociator(BaseAssociator):
             if src in catalog_df.columns:
                 catalog_df[dst] = catalog_df.pop(src) * 1000.0
 
-        # without amplitudes GaMMA fills magnitude with the 999 placeholder
-        if not self.config.get("use_amplitude") and "magnitude" in catalog_df.columns:
-            catalog_df["magnitude"] = np.nan
+        origins_df = pd.DataFrame(
+            {
+                "origin_index": catalog_df["origin_index"],
+                "origin_method": self.name,
+                "origin_time": pd.to_datetime(catalog_df.get("time"),
+                                              errors="coerce"),
+                "x": catalog_df.get("x"),
+                "y": catalog_df.get("y"),
+                "z": catalog_df.get("z"),
+                "number_picks": catalog_df.get("number_picks"),
+            }
+        )
+        # Without amplitudes GaMMA fills magnitude with a 999 placeholder, so
+        # it is only a real magnitude when use_amplitude is on. It rides along
+        # as an extra column for the event row; NaN otherwise.
+        origins_df["magnitude"] = (
+            catalog_df.get("magnitude") if self.config.get("use_amplitude")
+            else np.nan
+        )
 
         # GaMMA returns bare (pick_index, event_index, score) tuples. NOTE the
-        # third element is a per-pick mixture likelihood density (unbounded,
-        # unit-dependent) -- NOT the same quantity as the event-level
-        # "gamma_score", which is a soft pick count. Not a fit measure.
-        assignments_df = pd.DataFrame(
-            assignments, columns=["pick_index", "event_index", "gamma_score"]
+        # third element is a per-pick mixture likelihood *density* (unbounded,
+        # unit-dependent), not a normalized probability -- it is stored in the
+        # associations.probability column as-is, so compare it only against
+        # other values from the same run.
+        raw = pd.DataFrame(
+            assignments, columns=["pick_index", "origin_index", "probability"]
         )
-        if len(assignments_df):
-            idx = assignments_df["pick_index"].astype(int).to_numpy()
-            assignments_df["pick_id"] = pick_df["pick_id"].iloc[idx].to_numpy()
-        else:
-            assignments_df["pick_id"] = pd.Series(dtype="int64")
+        associations_df = pd.DataFrame(columns=ASSOCIATION_COLUMNS)
+        if len(raw):
+            idx = raw["pick_index"].astype(int).to_numpy()
+            associations_df = pd.DataFrame(
+                {
+                    "pick_id": pick_df["pick_id"].iloc[idx].to_numpy(),
+                    "origin_index": raw["origin_index"].to_numpy(),
+                    "association_method": self.name,
+                    "probability": raw["probability"].to_numpy(),
+                }
+            )
 
-        return catalog_df, assignments_df
+        return origins_df, associations_df
 
 
 
@@ -658,12 +635,12 @@ class GammaAssociator(BaseAssociator):
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
-    """Event locations on the cable geometry | picks-on-data, event-colored.
+def plot_association(picks_ev, origins_df, patch=None, title="", cmap="gray"):
+    """Origin locations on the cable geometry | picks-on-data, origin-colored.
 
-    Left: the fiber in 3D with one star per event (one color per event).
+    Left: the fiber in 3D with one star per origin (one color per origin).
     Right: picks over time/distance -- light gray = unassociated, colored =
-    its event (colors match the stars); drawn over the patch waterfall when
+    its origin (colors match the stars); drawn over the patch waterfall when
     ``patch`` is given, otherwise on a plain scatter.
 
     The fiber line comes from the patch's x/y/z coords only, so it adapts to
@@ -676,10 +653,10 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
     Parameters
     ----------
     picks_ev : pandas.DataFrame
-        Picks with an ``event_index`` column (NaN = unassociated), i.e. the
-        associator's picks joined to its assignments on pick id.
-    catalog_df : pandas.DataFrame
-        Event catalog with ``event_index`` and ``x``, ``y``, ``z`` (meters).
+        Picks with an ``origin_index`` column (NaN = unassociated), i.e. the
+        associator's picks joined to its associations on pick id.
+    origins_df : pandas.DataFrame
+        Origins with ``origin_index`` and ``x``, ``y``, ``z`` (meters).
     patch : dascore.Patch, optional
         Waterfall background (and fiber geometry, if it carries x/y/z).
     cmap : str
@@ -700,7 +677,7 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
         if np.isfinite(arrs[0]).any():
             geom = arrs
 
-    event_ids = sorted(picks_ev["event_index"].dropna().unique())
+    event_ids = sorted(picks_ev["origin_index"].dropna().unique())
     ev_cmap = plt.get_cmap("tab10")
     ev_color = {ev: ev_cmap(k % 10) for k, ev in enumerate(event_ids)}
 
@@ -717,14 +694,14 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
         north_parts.append(f_north)
         dep_parts.append(f_dep)
     for ev in event_ids:
-        row = catalog_df[catalog_df["event_index"] == ev].iloc[0]
+        row = origins_df[origins_df["origin_index"] == ev].iloc[0]
         ax3d.scatter(row["y"], row["x"], row["z"], s=120,
                      marker="*", color=ev_color[ev], edgecolor="k",
-                     linewidths=0.5, label=f"event {int(ev)}")
-    if len(catalog_df):
-        east_parts.append(catalog_df["y"].to_numpy(float))
-        north_parts.append(catalog_df["x"].to_numpy(float))
-        dep_parts.append(catalog_df["z"].to_numpy(float))
+                     linewidths=0.5, label=f"origin {int(ev)}")
+    if len(origins_df):
+        east_parts.append(origins_df["y"].to_numpy(float))
+        north_parts.append(origins_df["x"].to_numpy(float))
+        dep_parts.append(origins_df["z"].to_numpy(float))
 
     # per-cable extent with true spatial proportions
     if east_parts:
@@ -750,7 +727,7 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
     ax3d.set_xlabel("Easting (m)", fontsize=8, labelpad=4)
     ax3d.set_ylabel("Northing (m)", fontsize=8, labelpad=4)
     ax3d.set_zlabel("depth (m)", fontsize=8, labelpad=2)
-    ax3d.set_title(f"{title}: event locations" if title else "event locations",
+    ax3d.set_title(f"{title}: origin locations" if title else "origin locations",
                    fontsize=10)
     ax3d.legend(fontsize=7, loc="upper left")
 
@@ -773,20 +750,20 @@ def plot_association(picks_ev, catalog_df, patch=None, title="", cmap="gray"):
         ax_w.invert_yaxis()
     picks_ev["t_s"] = (times - t0).dt.total_seconds()
 
-    un = picks_ev[picks_ev["event_index"].isna()]
+    un = picks_ev[picks_ev["origin_index"].isna()]
     if len(un):
         ax_w.scatter(un["t_s"], un["distance"], marker="|", s=25,
                      linewidths=0.8, color="0.75",
                      label=f"unassociated ({len(un)})", zorder=3)
-    asc = picks_ev.dropna(subset=["event_index"])
+    asc = picks_ev.dropna(subset=["origin_index"])
     if len(asc):
         ax_w.scatter(asc["t_s"], asc["distance"], marker="|", s=40,
                      linewidths=1.2, zorder=4,
-                     c=[ev_color[e] for e in asc["event_index"]])
+                     c=[ev_color[e] for e in asc["origin_index"]])
     for ev in event_ids:
-        n = int((asc["event_index"] == ev).sum())
+        n = int((asc["origin_index"] == ev).sum())
         ax_w.scatter([], [], marker="|", s=40, linewidths=1.2,
-                     color=ev_color[ev], label=f"event {int(ev)} ({n})")
+                     color=ev_color[ev], label=f"origin {int(ev)} ({n})")
     ax_w.set_xlabel("Time (s)")
     ax_w.set_ylabel("Distance (m)")
     ax_w.set_title(

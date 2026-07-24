@@ -111,11 +111,11 @@ print(windows)
 
 # %% ------------------------------------------------------------------------
 # 5. GaMMA association inside the detection windows, for BOTH pick sets.
-#    Picks are read from the store and the events/assignments are saved back.
-#    Both runs use the same associator (method="gamma"); they stay separate in
-#    the store because the save key is (cable_id, time window, method,
-#    pick_method), so the
-#    pick_method column ("phasenetdas" vs "sta_lta") distinguishes them.
+#    Picks are read from the store and origins/associations/events saved back.
+#    Both runs use the same associator ("gamma"), but they operate on disjoint
+#    pick sets (the "phasenetdas" picks vs the "sta_lta" ones), and the replace
+#    only supersedes associations on the picks of the run at hand -- so the two
+#    results coexist.
 # ----------------------------------------------------------------------------
 assoc = association.GammaAssociator.from_preset(
     "default",
@@ -126,17 +126,17 @@ assoc = association.GammaAssociator.from_preset(
 )
 
 # --- PhaseNet-DAS picks, gated by the detection windows
-cat_pn, asn_pn = assoc.run(
-    pick_method="phasenetdas", cable_id=cable_id, min_score=0.3,
+org_pn, asc_pn = assoc.run(
+    pick_method="phasenetdas", cable_id=cable_id, min_probability=0.3,
     windows=windows, plot=True, patch=patch)
 
-logging.info("gated GaMMA on PhaseNet-DAS: %d events, %d associated picks",
-             len(cat_pn), len(asn_pn))
+logging.info("gated GaMMA on PhaseNet-DAS: %d origins, %d associated picks",
+             len(org_pn), len(asc_pn))
 
 # --- STA/LTA picks, same windows
-cat_tr, asn_tr = assoc.run(
+org_tr, asc_tr = assoc.run(
     pick_method="sta_lta", cable_id=cable_id,
     windows=windows, plot=True, patch=patch)
-logging.info("gated GaMMA on STA/LTA: %d events, %d associated picks",
-             len(cat_tr), len(asn_tr))
+logging.info("gated GaMMA on STA/LTA: %d origins, %d associated picks",
+             len(org_tr), len(asc_tr))
 

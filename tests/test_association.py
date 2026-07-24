@@ -53,7 +53,7 @@ logging.info("geometry after preprocessing: %d/%d channels have x/y/z",
              int(np.sum(~np.isnan(_x))), len(_x))
 
 # %% ------------------------------------------------------------------------
-# 2. PhaseNet-DAS picks -> saved to the store (method="phasenetdas")
+# 2. PhaseNet-DAS picks -> saved to the store (pick_method="phasenetdas")
 # ----------------------------------------------------------------------------
 df_pn = sieve.picking.phasenet_das_picker(
     patch, min_prob=0.3, plot=False, cable_id=cable_id)
@@ -61,10 +61,10 @@ logging.info("PhaseNet-DAS: %d picks (P=%d, S=%d)", len(df_pn),
              (df_pn["phase"] == "P").sum(), (df_pn["phase"] == "S").sum())
 
 # %% ------------------------------------------------------------------------
-# 3. GaMMA association: read the picks from the store, save events back.
-#    Results are keyed on (cable_id, time window, method="gamma",
-#    pick_method="phasenetdas")
-#    -> rerunning on the same picks replaces them instead of duplicating.
+# 3. GaMMA association: read the picks from the store, save origins /
+#    associations / events back. Re-running supersedes this associator's
+#    previous associations on these picks and cascades to their origins and
+#    events, so results replace instead of duplicating.
 # ----------------------------------------------------------------------------
 assoc = association.GammaAssociator.from_preset(
     "default",
@@ -73,19 +73,14 @@ assoc = association.GammaAssociator.from_preset(
     min_picks_per_eq=100,
     vel={"p": 6.0, "s": 6.0 / 1.75},
 )
-catalog_df, assignments_df = assoc.run(
-    pick_method="phasenetdas", cable_id=cable_id, picks=df_pn, min_score=0.3,
-    plot=True, patch=patch)
+origins_df, associations_df = assoc.run(
+    pick_method="phasenetdas", cable_id=cable_id, picks=df_pn,
+    min_probability=0.3, plot=True, patch=patch)
 
+logging.info("GaMMA: %d origins, %d associated picks",
+             len(origins_df), len(associations_df))
 
-
-logging.info("GaMMA: %d events, %d associated picks",
-             len(catalog_df), len(assignments_df))
-
-if len(catalog_df):
-    _show = [c for c in ("event_index", "time", "x", "y", "z",
-                         "gamma_score", "number_picks", "number_p_picks",
-                         "number_s_picks") if c in catalog_df.columns]
-    print(catalog_df[_show])
+if len(origins_df):
+    print(origins_df)
 
 # %%

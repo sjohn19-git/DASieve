@@ -11,18 +11,28 @@ import pandas as pd
 from obspy.signal.trigger import classic_sta_lta, trigger_onset, ar_pick
 from dascore.utils.io import patch_to_obspy
 
-# Shared output schema for every picking method so that the returned
-# DataFrame is consistent across "sta_lta", "ar", and "phasenet". Methods
-# that don't produce a given field leave it as NaN.
+# Shared output schema for every picking method, identical to the columns of
+# the store's ``picks`` table -- a DataFrame straight from a picker and a row
+# read back out of the database look the same. Methods that don't produce a
+# given field leave it as NaN.
 PICK_COLUMNS = [
+    "cable_id",
     "distance",
+    "pick_method",
+    "phase",
+    "onset_time",
     "x",
     "y",
     "z",
-    "phase",
-    "onset_sample",
-    "onset_time",
-    "score",
+    "probability",
+    "file_starttime",
+    "file_endtime",
+]
+
+# The part each picker actually computes; the rest (which fiber, which
+# method, which file window) is attached by :func:`_finalize_picks`.
+_PICK_CORE_COLUMNS = [
+    "distance", "phase", "onset_time", "x", "y", "z", "probability",
 ]
 
 
@@ -59,7 +69,8 @@ def _auto_device():
 
 
 def time_window_from_patch(patch):
-    """Return the patch's ``(time_start, time_end)`` as ISO-8601 strings.
+    """Return the patch's ``(file_starttime, file_endtime)`` as ISO-8601
+    strings.
 
     This is the time half of the store's run key: the span of data the picks
     were produced from. Taken from the patch's time coordinate, so it reflects
@@ -72,11 +83,33 @@ def time_window_from_patch(patch):
     return pd.Timestamp(t[0]).isoformat(), pd.Timestamp(t[-1]).isoformat()
 
 
-def _save_to_store(df, cable_id, method, patch, db_path=None):
+def _finalize_picks(df, patch, cable_id, pick_method):
+    """Complete a picker's core output into the full :data:`PICK_COLUMNS`
+    schema.
+
+    Attaches the run metadata every pick carries -- which fiber
+    (``cable_id``), which picker (``pick_method``), and the span of data it
+    was picked from (``file_starttime`` / ``file_endtime``, taken from the
+    patch). ``cable_id`` may be None: the column is then NULL, which is fine
+    for a returned DataFrame but cannot be saved to the store.
+    """
+    file_starttime, file_endtime = time_window_from_patch(patch)
+    df = df.copy()
+    df["cable_id"] = cable_id
+    df["pick_method"] = pick_method
+    df["file_starttime"] = file_starttime
+    df["file_endtime"] = file_endtime
+    return df[PICK_COLUMNS]
+
+
+def _save_to_store(df, cable_id, db_path=None):
     """Persist picks via :func:`dasieve.store.save_picks`. Imported lazily to
-    avoid a circular import (dasieve.store imports from this module). Replaces
-    existing rows for (cable_id, time_start, time_end, method); the time window
-    is derived from ``patch``."""
+    avoid a circular import (dasieve.store imports from this module).
+
+    The run key is carried by the DataFrame itself, so nothing needs passing
+    here beyond the database path. Replaces existing rows for that key, and
+    cascades the replacement to any associations/origins/events built from the
+    superseded picks."""
     if cable_id is None:
         raise ValueError(
             "db_save=True requires cable_id (which fiber the data came from). "
@@ -84,12 +117,8 @@ def _save_to_store(df, cable_id, method, patch, db_path=None):
         )
     from .store import save_picks
 
-    time_start, time_end = time_window_from_patch(patch)
     kwargs = {} if db_path is None else {"db_path": db_path}
-    return save_picks(
-        df, cable_id=cable_id, method=method,
-        time_start=time_start, time_end=time_end, **kwargs
-    )
+    return save_picks(df, **kwargs)
 
 
 def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
@@ -140,6 +169,20 @@ def _pick_ar(
     return picks, None
 
 
+def _pick_seconds(df, time_vals):
+    """Seconds from the patch start for each pick, from its ``onset_time``.
+
+    The store schema keeps only absolute onset times, so the position of a
+    pick within the patch is derived here rather than carried as a sample
+    index. Returns a float array aligned to ``df``'s rows.
+    """
+    onsets = pd.to_datetime(df["onset_time"], errors="coerce").to_numpy(
+        dtype="datetime64[ns]"
+    )
+    t0 = np.asarray(time_vals, dtype="datetime64[ns]")[0]
+    return (onsets - t0) / np.timedelta64(1, "s")
+
+
 def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap="RdBu_r"):
     """Single plotting routine used for every method. Plots P/S picks when
     present, otherwise trigger onsets."""
@@ -148,6 +191,7 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap="RdBu_r"):
     dist_vals = patch.coords.get_array("distance")
     time_vals = patch.coords.get_array("time")
     t_sec = (time_vals - time_vals[0]) / np.timedelta64(1, "s")
+    pick_t = _pick_seconds(df, time_vals)
 
     phase_color = {"P": "blue", "S": "red"}
 
@@ -175,9 +219,9 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap="RdBu_r"):
     )
 
     # tick markers for every pick, colored by phase
-    for _, row in df.iterrows():
+    for (_, row), t in zip(df.iterrows(), pick_t):
         ax_img.plot(
-            t_sec[int(row["onset_sample"])],
+            t,
             row["distance"],
             "|",
             color=phase_color.get(row["phase"], "blue"),
@@ -197,11 +241,11 @@ def _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap="RdBu_r"):
 
     # --- middle: selected channel waveform ---
     ax_trace.plot(t_sec, data_dt[ch_idx], color="black", linewidth=0.6)
-    ch_picks = df[df["distance"] == dist_vals[ch_idx]]
-    for _, row in ch_picks.iterrows():
+    on_channel = (df["distance"] == dist_vals[ch_idx]).to_numpy()
+    for row, t in zip(df[on_channel].to_dict("records"), pick_t[on_channel]):
         phase = row["phase"]
         ax_trace.axvline(
-            t_sec[int(row["onset_sample"])],
+            t,
             color=phase_color.get(phase, "blue"),
             linewidth=1.2,
             linestyle="--",
@@ -273,8 +317,8 @@ def trigger_picker(
 
     db_save : if True (default), the picks are saved to the store via
         ``store.save_picks`` with this ``method`` as the store method,
-        replacing previous rows for (cable_id, time window, method) -- the
-        window is taken from the patch. ``db_path`` overrides
+        replacing previous rows for (cable_id, file window, pick_method) --
+        the window is taken from the patch. ``db_path`` overrides
         the default store location. Pass db_save=False to only return the
         DataFrame.
     """
@@ -312,30 +356,30 @@ def trigger_picker(
             raise ValueError(f"unknown method: {method!r}")
 
         for p in picks:
+            # the sample index is internal: only the absolute onset_time is
+            # part of the schema
             on = p["onset_sample"]
             rows.append(
                 {
                     "distance": dist_vals[i],
+                    "phase": p["phase"],
+                    "onset_time": time_vals[on],
                     "x": x_arr[i],
                     "y": y_arr[i],
                     "z": z_arr[i],
-                    "phase": p["phase"],
-                    "onset_sample": on,
-                    "onset_time": time_vals[on],
-                    "score": p.get("score", np.nan),
+                    "probability": p.get("probability", np.nan),
                 }
             )
 
-    df = pd.DataFrame(
-        rows,
-        columns=PICK_COLUMNS,
+    df = _finalize_picks(
+        pd.DataFrame(rows, columns=_PICK_CORE_COLUMNS), patch, cable_id, method
     )
 
     if plot:
         _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, method, patch, db_path=db_path)
+        _save_to_store(df, cable_id, db_path=db_path)
 
     return df
 
@@ -508,9 +552,9 @@ def phasenet_das_picker(
     Returns
     -------
     pandas.DataFrame with columns == PICK_COLUMNS. When ``db_save`` is True
-    (default) the picks are also saved to the store with method
-    ``"phasenetdas"``, replacing previous rows for (cable_id, time window,
-    method); the window is taken from the patch.
+    (default) the picks are also saved to the store with ``pick_method`` set
+    to ``"phasenetdas"``, replacing previous rows for (cable_id, file window,
+    pick_method); the window is taken from the patch.
     """
     import torch
     phases=("P", "S")
@@ -561,8 +605,11 @@ def phasenet_das_picker(
         frames.append(df_raw)
 
     x_arr, y_arr, z_arr = _geom_arrays(patch)
-    df = _phasenet_picks_to_df(
-        frames, dist_vals, time_vals, len(time_vals), x_arr, y_arr, z_arr
+    df = _finalize_picks(
+        _phasenet_picks_to_df(
+            frames, dist_vals, time_vals, len(time_vals), x_arr, y_arr, z_arr
+        ),
+        patch, cable_id, "phasenetdas",
     )
 
     if plot:
@@ -571,7 +618,7 @@ def phasenet_das_picker(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
+        _save_to_store(df, cable_id, db_path=db_path)
 
     return df
 
@@ -619,10 +666,10 @@ def phasenet_das_picker_disk(
     Returns
     -------
     pandas.DataFrame with columns == PICK_COLUMNS. PhaseNet picks populate
-    ``score`` (phase probability); cft_* and off_* columns are NaN. When
-    ``db_save`` is True (default) the picks are also saved to the store with
-    method ``"phasenetdas"``, replacing previous rows for
-    (cable_id, time window, method); the window is taken from the patch.
+    ``probability`` (phase probability). When ``db_save`` is True (default)
+    the picks are also saved to the store with ``pick_method`` set to
+    ``"phasenetdas"``, replacing previous rows for
+    (cable_id, file window, pick_method); the window is taken from the patch.
     """
     import torch
     import matplotlib
@@ -688,8 +735,11 @@ def phasenet_das_picker_disk(
             continue
 
     x_arr, y_arr, z_arr = _geom_arrays(patch)
-    df = _phasenet_picks_to_df(
-        frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_arr
+    df = _finalize_picks(
+        _phasenet_picks_to_df(
+            frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_arr
+        ),
+        patch, cable_id, "phasenetdas",
     )
 
     if not keep_files and owns_dir:
@@ -703,18 +753,19 @@ def phasenet_das_picker_disk(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
+        _save_to_store(df, cable_id, db_path=db_path)
 
     return df
 
 
 def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_arr):
     """Map EQNet PhaseNet-DAS pick rows (channel_index, phase_index,
-    phase_score, phase_type) into the shared PICK_COLUMNS schema.
+    phase_score, phase_type) into the core pick schema.
     ``x_arr/y_arr/z_arr`` are the per-channel geometry arrays from
-    :func:`_geom_arrays`, indexed by channel."""
+    :func:`_geom_arrays`, indexed by channel. The caller completes the result
+    with :func:`_finalize_picks`."""
     if not frames:
-        return pd.DataFrame(columns=PICK_COLUMNS)
+        return pd.DataFrame(columns=_PICK_CORE_COLUMNS)
 
     picks = pd.concat(frames, ignore_index=True)
     n_dist = len(dist_vals)
@@ -729,19 +780,18 @@ def _phasenet_picks_to_df(frames, dist_vals, time_vals, n_time, x_arr, y_arr, z_
         rows.append(
             {
                 "distance": dist_vals[ch],
+                "phase": r["phase_type"],
+                "onset_time": time_vals[smp],
                 "x": x_arr[ch],
                 "y": y_arr[ch],
                 "z": z_arr[ch],
-                "phase": r["phase_type"],
-                "onset_sample": smp,
-                "onset_time": time_vals[smp],
-                "score": float(r["phase_score"]),
+                "probability": float(r["phase_score"]),
             }
         )
 
-    df = pd.DataFrame(rows, columns=PICK_COLUMNS)
+    df = pd.DataFrame(rows, columns=_PICK_CORE_COLUMNS)
     if not df.empty:
-        df.sort_values(["distance", "onset_sample"], inplace=True, ignore_index=True)
+        df.sort_values(["distance", "onset_time"], inplace=True, ignore_index=True)
     return df
 
 
@@ -822,13 +872,14 @@ def _model_window_seconds(base):
 
 def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr):
     """Map SeisBench ``DASPick`` objects (time=datetime64, channel=<distance
-    coord value>, confidence, phase) into the shared PICK_COLUMNS schema.
+    coord value>, confidence, phase) into the core pick schema.
     ``x_arr/y_arr/z_arr`` are the per-channel geometry arrays from
-    :func:`_geom_arrays`, indexed by channel.
+    :func:`_geom_arrays`, indexed by channel. The caller completes the result
+    with :func:`_finalize_picks`.
 
     ``channel`` is snapped to the nearest distance value and the pick time to
-    the nearest sample index so the result drops into PICK_COLUMNS and the
-    shared ``_plot_picks`` channel-equality logic keeps working."""
+    the nearest sample so the onset lands on the patch's own time grid, like
+    every other picker's."""
     n_dist = len(dist_vals)
     dist_arr = np.asarray(dist_vals, dtype=float)
 
@@ -847,19 +898,18 @@ def _das_picks_to_df(picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_ar
         rows.append(
             {
                 "distance": dist_vals[ch],
+                "phase": p.phase,
+                "onset_time": time_vals[smp],
                 "x": x_arr[ch],
                 "y": y_arr[ch],
                 "z": z_arr[ch],
-                "phase": p.phase,
-                "onset_sample": smp,
-                "onset_time": time_vals[smp],
-                "score": float(p.confidence),
+                "probability": float(p.confidence),
             }
         )
 
-    df = pd.DataFrame(rows, columns=PICK_COLUMNS)
+    df = pd.DataFrame(rows, columns=_PICK_CORE_COLUMNS)
     if not df.empty:
-        df.sort_values(["distance", "onset_sample"], inplace=True, ignore_index=True)
+        df.sort_values(["distance", "onset_time"], inplace=True, ignore_index=True)
     return df
 
 
@@ -945,8 +995,9 @@ def seisbench_picker(
         ``cmap`` sets the waterfall colormap (default "RdBu_r").
     cable_id, db_save, db_path : store persistence. When ``db_save`` is
         True (default) the picks are saved, replacing previous rows for
-        (cable_id, time window, method); the window is taken from the patch.
-    method : store method label. Defaults to ``"<model_key>_sb"`` (e.g.
+        (cable_id, file window, pick_method); the window is taken from the
+        patch.
+    method : the ``pick_method`` label. Defaults to ``"<model_key>_sb"`` (e.g.
         "eqtransformer_sb", "phasenet_sb"); the ``_sb`` suffix keeps SeisBench
         results separate from the 2-D PhaseNet-DAS picks ("phasenetdas").
     **classify_kwargs : forwarded to the wrapper's ``classify`` (e.g.
@@ -954,8 +1005,8 @@ def seisbench_picker(
 
     Returns
     -------
-    pandas.DataFrame with columns == PICK_COLUMNS. Picks populate ``score``
-    (confidence); cft_* and off_* columns are NaN.
+    pandas.DataFrame with columns == PICK_COLUMNS. Picks populate
+    ``probability`` (the model's confidence).
     """
     import asyncio
     from seisbench.models import DASWaveformModelWrapper, DASPickingCallback
@@ -1014,8 +1065,11 @@ def seisbench_picker(
         if plist:
             picks.extend(list(plist))
 
-    df = _das_picks_to_df(
-        picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr
+    df = _finalize_picks(
+        _das_picks_to_df(
+            picks, dist_vals, time_vals, fs, t0_ns, n_time, x_arr, y_arr, z_arr
+        ),
+        patch, cable_id, method,
     )
 
     if plot:
@@ -1024,7 +1078,7 @@ def seisbench_picker(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, method, patch, db_path=db_path)
+        _save_to_store(df, cable_id, db_path=db_path)
 
     return df
 

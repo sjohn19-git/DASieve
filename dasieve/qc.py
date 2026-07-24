@@ -4,15 +4,16 @@ qc.py
 PSD QC product for DASieve.
 
 Computes per-channel Welch PSD from a DASCore patch and stores it in the
-DASieve SQLite database -- the same file that holds picks and events
+DASieve SQLite database -- the same file that holds the picks catalog
 (default ``~/DASieve/dasieve.sqlite``; see :mod:`dasieve.store`). One
 ``psd_runs`` row per processed patch (the frequency vector is stored once
 there), one ``psd`` row per channel holding that channel's PSD curve as a
 float32 blob. Appends are plain INSERTs, so the store scales to months of
 data without ever reloading what is already stored. Runs are keyed on
-(cable_id, time_start, time_end) -- the span of data the PSD was computed
-over, taken from the patch like the pickers do -- so re-processing the same
-span replaces the previous rows, like the picks table.
+(cable_id, file_starttime, file_endtime) -- the span of data the PSD was
+computed over, taken from the patch like the pickers do, and named exactly as
+in the picks table -- so re-processing the same span replaces the previous
+rows.
 
 Pipeline position: runs on the raw patch (before resample/decimate),
 corresponding to the "PSD QC Product — always runs" branch in the architecture.
@@ -53,8 +54,8 @@ def compute_psd(
     plot: bool = False,
     db_path: str = DEFAULT_DB_PATH,
     cable_id: str | None = None,
-    time_start=None,
-    time_end=None,
+    file_starttime=None,
+    file_endtime=None,
     **plot_kwargs,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -85,7 +86,7 @@ def compute_psd(
         keys the stored run together with the time window and filters the
         plot. Required when ``append`` is True, like ``db_save`` in the
         pickers.
-    time_start, time_end : datetime-like, optional
+    file_starttime, file_endtime : datetime-like, optional
         The span of data the PSD covers, used as the run key when appending.
         Defaults to the patch's own time window (see
         :func:`dasieve.picking.time_window_from_patch`), so a trimmed patch
@@ -136,13 +137,13 @@ def compute_psd(
     psd_db = (10.0 * np.log10(np.maximum(Pxx, 1e-30))).astype(np.float32)
 
     if append:
-        if time_start is None or time_end is None:
-            time_start, time_end = time_window_from_patch(patch)
+        if file_starttime is None or file_endtime is None:
+            file_starttime, file_endtime = time_window_from_patch(patch)
         save_psd(freqs, psd_db, db_path, cable_id=cable_id,
-                 time_start=time_start, time_end=time_end)
+                 file_starttime=file_starttime, file_endtime=file_endtime)
         log.debug(
-            f"Saved PSD {time_start}..{time_end} (cable_id={cable_id!r}) "
-            f"to {db_path}"
+            f"Saved PSD {file_starttime}..{file_endtime} "
+            f"(cable_id={cable_id!r}) to {db_path}"
         )
 
     if plot:
