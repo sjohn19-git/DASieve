@@ -102,14 +102,16 @@ def _finalize_picks(df, patch, cable_id, pick_method):
     return df[PICK_COLUMNS]
 
 
-def _save_to_store(df, cable_id, db_path=None):
+def _save_to_store(df, cable_id, pick_method, patch, db_path=None):
     """Persist picks via :func:`dasieve.store.save_picks`. Imported lazily to
     avoid a circular import (dasieve.store imports from this module).
 
-    The run key is carried by the DataFrame itself, so nothing needs passing
-    here beyond the database path. Replaces existing rows for that key, and
-    cascades the replacement to any associations/origins/events built from the
-    superseded picks."""
+    ``cable_id``/``pick_method``/``patch`` are passed through explicitly
+    rather than relying on ``save_picks`` inferring them from ``df``'s own
+    columns: that inference reads distinct non-null values, which is exactly
+    what an empty ``df`` (no picks found in this file) never has -- and an
+    empty result must still save, to clear a stale previous run for this key
+    (see :func:`dasieve.store.save_picks`)."""
     if cable_id is None:
         raise ValueError(
             "db_save=True requires cable_id (which fiber the data came from). "
@@ -118,7 +120,8 @@ def _save_to_store(df, cable_id, db_path=None):
     from .store import save_picks
 
     kwargs = {} if db_path is None else {"db_path": db_path}
-    return save_picks(df, **kwargs)
+    return save_picks(df, cable_id=cable_id, pick_method=pick_method,
+                      patch=patch, **kwargs)
 
 
 def _pick_sta_lta(trace, sta, lta, thr_on, thr_off):
@@ -379,7 +382,7 @@ def trigger_picker(
         _plot_picks(patch, df, ch_idx, cft_plot, thr_on, thr_off, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, db_path=db_path)
+        _save_to_store(df, cable_id, method, patch, db_path=db_path)
 
     return df
 
@@ -618,7 +621,7 @@ def phasenet_das_picker(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, db_path=db_path)
+        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
 
     return df
 
@@ -753,7 +756,7 @@ def phasenet_das_picker_disk(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, db_path=db_path)
+        _save_to_store(df, cable_id, "phasenetdas", patch, db_path=db_path)
 
     return df
 
@@ -1078,7 +1081,7 @@ def seisbench_picker(
         _plot_picks(patch, df, ch_idx, None, None, None, cmap=cmap)
 
     if db_save:
-        _save_to_store(df, cable_id, db_path=db_path)
+        _save_to_store(df, cable_id, method, patch, db_path=db_path)
 
     return df
 
